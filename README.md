@@ -57,7 +57,17 @@ brew install --cask karabiner-elements
 open /opt/homebrew/Caskroom/karabiner-elements/*/Karabiner-Elements.pkg
 ```
 
-Then open Karabiner-Elements once from Spotlight so it can register its system extension (System Settings → Privacy & Security → "Allow") and create `~/.config/karabiner/`.
+### First launch of Karabiner-Elements
+
+Open Karabiner-Elements once from Spotlight. Karabiner uses a daemon-plus-helper architecture and asks for permissions in three separate places. Approve them all:
+
+1. **Accessibility popup for `Karabiner-Core-Service.app`.** Click "Open System Settings" → enable the toggle for Karabiner-Core-Service.
+2. **Karabiner-Elements Settings → "Background services"** wizard. Click through to choose background services. This kicks you into System Settings.
+3. **System Settings → General → Login Items & Extensions** → under "Allow in the Background", enable both:
+   - `Karabiner-Elements Non-Privileged Agents v2.app`
+   - `Karabiner-Elements Privileged Daemons v2.app`
+
+Without all three, the Caps Lock → F19 remap silently does nothing. After Karabiner is fully approved, `~/.config/karabiner/` exists and `shout setup` can drop the rule in.
 
 ### Wire up the configs and start the daemon
 
