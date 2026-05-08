@@ -30,36 +30,58 @@ The daemon stays loaded in memory (the Parakeet model takes ~1.3 s to load and ~
 
 ## Install
 
-Shout is distributed as a Homebrew formula. Once the repo is pushed to GitHub:
+Shout is distributed as a Homebrew formula. v0.1.0 is not yet tagged with a stable tarball, so use `--HEAD`:
 
 ```bash
 brew tap yeutterg/shout https://github.com/yeutterg/shout
 brew install --HEAD yeutterg/shout/shout
 
-# Until v0.1.0 is tagged with a real tarball SHA, --HEAD is the install path.
+# Hammerspoon (no sudo needed):
+brew install --cask hammerspoon
+```
 
-# GUI prerequisites — Homebrew formulas can't depend on casks, so install these manually:
-brew install --cask karabiner-elements hammerspoon
+### Karabiner-Elements requires an interactive sudo prompt
 
-# Wire up the configs (Karabiner rule, Hammerspoon Lua, launchd agent):
+The `karabiner-elements` cask installs a system extension and **requires `sudo` from a real terminal** — Homebrew shells out to `/usr/sbin/installer`, which fails with `sudo: a terminal is required to read the password` if invoked from a non-TTY context (a Claude Code `! command` prompt, an editor task runner, a `launchctl`-spawned shell, etc.).
+
+Pick whichever path is convenient:
+
+```bash
+# Option A — from a real terminal (Terminal.app, iTerm2, Ghostty, …)
+brew install --cask karabiner-elements
+# sudo will prompt; type your password.
+
+# Option B — let macOS's GUI installer prompt for the password
+# Homebrew's `--cask` step downloads the .pkg even when the install fails;
+# you can run it directly:
+open /opt/homebrew/Caskroom/karabiner-elements/*/Karabiner-Elements.pkg
+```
+
+Then open Karabiner-Elements once from Spotlight so it can register its system extension (System Settings → Privacy & Security → "Allow") and create `~/.config/karabiner/`.
+
+### Wire up the configs and start the daemon
+
+```bash
 shout setup
-
-# Start the daemon as a login agent:
 brew services start shout
 ```
 
-After that, finish the one-time permission grants:
+`shout setup` copies the Karabiner rule, the Hammerspoon Lua, and appends `require("shout")` to `~/.hammerspoon/init.lua`. It does NOT install a launch agent — `brew services` handles that. (Use `shout setup --launchagent` only when running outside brew.)
 
-| Permission | Where | Why |
-| --- | --- | --- |
-| Microphone | System Settings → Privacy & Security → Microphone | sounddevice mic capture |
-| Accessibility | System Settings → Privacy & Security → Accessibility | Quartz CGEvent typing at cursor |
-| Input Monitoring | System Settings → Privacy & Security → Input Monitoring | Hammerspoon listens for F19 |
-| Karabiner system extension | System Settings → Privacy & Security | Caps Lock → F19 HID-layer remap |
+### Permissions (one-time)
 
-Karabiner-Elements also requires a one-click step: open Karabiner-Elements → Complex Modifications → Add rule → enable "Shout: Caps Lock → F19 (push-to-talk)".
+| Permission | Granted to | Why | How |
+| --- | --- | --- | --- |
+| Microphone | the brew-installed Python (`/opt/homebrew/opt/shout/libexec/venv/bin/python3.12`) | sounddevice mic capture | macOS prompts on first PTT |
+| Accessibility | same Python binary | Quartz CGEvent typing at cursor | System Settings → Privacy & Security → Accessibility → `+` → ⌘⇧G to paste the path above |
+| Input Monitoring | Hammerspoon | listens for F19 | macOS prompts on Hammerspoon launch |
+| System Extension | Karabiner-Elements | Caps Lock → F19 HID-layer remap | Karabiner prompts on first launch |
 
-Then run `shout doctor`. Every check should pass.
+After granting Accessibility manually, **restart the daemon** so it inherits the new permission: `brew services restart shout`.
+
+Then in Karabiner-Elements: **Complex Modifications** → **Add rule** → enable **"Shout: Caps Lock → F19 (push-to-talk)"**. Reload Hammerspoon (menu bar → Reload Config) so it picks up `shout.lua`.
+
+Run `shout doctor`. Every check should be ✓.
 
 ## CLI
 
