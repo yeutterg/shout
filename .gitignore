@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.uv-cache/
+.DS_Store
+.python-version
+
+# Bench output
+bench-results/

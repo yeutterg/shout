@@ -1,0 +1,36 @@
+[project]
+name = "shout"
+version = "0.1.0"
+description = "Local-first push-to-talk dictation for macOS, powered by Parakeet via MLX"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [
+    { name = "Greg Yeutter", email = "yeutterg@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "parakeet-mlx>=0.3",
+    "sounddevice>=0.5",
+    "numpy>=2.0",
+    "pyobjc-framework-Quartz>=10.3",
+]
+
+[project.scripts]
+shout = "shout.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/shout"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"hammerspoon/shout.lua" = "shout/_resources/hammerspoon/shout.lua"
+"karabiner/caps-to-f19.json" = "shout/_resources/karabiner/caps-to-f19.json"
+"launchd/com.greg.shout.plist" = "shout/_resources/launchd/com.greg.shout.plist"
+
+[dependency-groups]
+dev = [
+    "homebrew-pypi-poet>=0.10",
+]

@@ -1,0 +1,20 @@
+{
+  "title": "Shout: Caps Lock → F19 (push-to-talk)",
+  "rules": [
+    {
+      "description": "Caps Lock → F19 (Shout PTT). Held = push-to-talk; triple-tap = real Caps Lock toggle.",
+      "manipulators": [
+        {
+          "type": "basic",
+          "from": {
+            "key_code": "caps_lock",
+            "modifiers": { "optional": ["any"] }
+          },
+          "to": [
+            { "key_code": "f19" }
+          ]
+        }
+      ]
+    }
+  ]
+}
