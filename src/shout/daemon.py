@@ -9,17 +9,21 @@ Lifecycle (single process, three threads):
                     posts session-state messages onto cmd_q.
 
   Worker thread     Owns the MLX model and the active Streamer. Loads
-                    weights once at startup, then runs a session loop:
-                    awaits start, ticks at ~30 Hz pushing audio through
-                    parakeet-mlx, types newly-finalized text via Quartz,
-                    posts overlay updates onto ui_q.
+                    weights once at startup, pre-warms the encoder
+                    shaders against a chunk of silence (otherwise the
+                    first real session would pay a ~2.5 s shader-compile
+                    cost — see scripts/bench-cold-start.py), then runs
+                    a session loop: awaits start, ticks at ~30 Hz,
+                    types newly-finalized text via Quartz, posts overlay
+                    updates onto ui_q.
 
 MLX has per-thread stream state — the model and all add_audio calls
 must happen on the same thread that loaded the model. That is why the
 worker thread (not the main thread) loads the model and runs Streamer.
 
 The daemon survives session-level errors: a failed start or a crashed
-audio backend logs and returns to idle, ready for the next start.
+audio backend logs and returns to idle, ready for the next start. Model
+load failures are fatal and exit non-zero so launchd can restart us.
 """
 
 from __future__ import annotations
@@ -36,7 +40,7 @@ from typing import Optional
 
 from . import inject, paths, protocol
 from .overlay import Overlay
-from .stream import Streamer
+from .stream import DEFAULT_CONTEXT_SIZE, Streamer
 
 DEFAULT_MODEL = "mlx-community/parakeet-tdt-0.6b-v3"
 
@@ -47,6 +51,12 @@ _TICK_INTERVAL_S = 1.0 / _TICK_HZ
 
 # How often the main thread drains the UI queue.
 _UI_POLL_MS = 33
+
+# Shader pre-warm: feed N seconds of silence through transcribe_stream
+# before the first real session, so the Metal kernels are JIT-compiled
+# and cached. ~1 s is plenty for the encoder pass to fire at least once.
+_WARMUP_AUDIO_SECONDS = 1.0
+_WARMUP_SAMPLE_RATE = 16_000
 
 log = logging.getLogger("shout.daemon")
 
@@ -68,6 +78,7 @@ class Daemon:
         self._model_ready = threading.Event()
         self._session_running = threading.Event()
         self._shutdown = threading.Event()
+        self._fatal = False  # set on irrecoverable failure (model load)
 
         self._root: Optional[tk.Tk] = None
         self._overlay: Optional[Overlay] = None
@@ -101,7 +112,7 @@ class Daemon:
                 os.unlink(paths.SOCKET_PATH)
             except FileNotFoundError:
                 pass
-        return 0
+        return 1 if self._fatal else 0
 
     # ----------------- main thread (tk) -----------------
 
@@ -126,6 +137,7 @@ class Daemon:
 
     def _worker_loop(self) -> None:
         # Imported here so MLX initializes on this thread.
+        import mlx.core as mx
         import parakeet_mlx
 
         log.info("loading model …")
@@ -134,9 +146,28 @@ class Daemon:
             model = parakeet_mlx.from_pretrained(self._model_id)
         except Exception:
             log.exception("model load failed")
+            self._fatal = True
             self._shutdown.set()
             return
         log.info("model loaded in %.2f s", time.perf_counter() - t0)
+
+        # Pre-warm shader compilation. Without this, the very first
+        # add_audio() call of the first session takes ~2.5 s while Metal
+        # kernels are JIT-compiled (see bench-cold-start.py phase
+        # `first_chunk_s` first run vs. warm runs).
+        try:
+            t0 = time.perf_counter()
+            silence = mx.zeros(
+                int(_WARMUP_AUDIO_SECONDS * _WARMUP_SAMPLE_RATE)
+            )
+            with model.transcribe_stream(context_size=DEFAULT_CONTEXT_SIZE) as s:
+                s.add_audio(silence)
+            log.info("shaders warm in %.2f s", time.perf_counter() - t0)
+        except Exception:
+            # Pre-warm is best-effort — if it fails, real sessions still
+            # work, they just pay the cold-shader cost on first audio.
+            log.warning("shader warm-up failed", exc_info=True)
+
         self._model_ready.set()
 
         while not self._shutdown.is_set():

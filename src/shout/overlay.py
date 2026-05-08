@@ -5,18 +5,16 @@ v0 polish target: legible and unobtrusive. Swift NSPanel is a v1 swap.
 
 Threading rule: all tkinter calls must come from the thread that owns
 the Tk root (the daemon's main thread). Workers schedule updates via
-`root.after(0, fn)` which is thread-safe in CPython.
+the daemon's UI queue, drained by `Daemon._drain_ui_queue`.
 """
 
 from __future__ import annotations
 
 import tkinter as tk
-from typing import Optional
 
 
 _BG = "#1a1a1a"
-_FG_DRAFT = "#aaaaaa"
-_FG_FINAL = "#ffffff"
+_FG = "#dddddd"
 _FONT = ("Helvetica Neue", 18)
 _HEIGHT = 56
 _BOTTOM_MARGIN = 80
@@ -44,7 +42,7 @@ class Overlay:
         self._label = tk.Label(
             self._win,
             text="",
-            fg=_FG_DRAFT,
+            fg=_FG,
             bg=_BG,
             font=_FONT,
             padx=18,
@@ -61,18 +59,12 @@ class Overlay:
         self._win.withdraw()
         self._label.configure(text="")
 
-    def set_text(self, draft: str, final_tail: Optional[str] = None) -> None:
-        """Render tentative-draft text. `final_tail` is shown brighter
-        as a hint that the trailing portion has finalized but is not
-        yet typed (transient state — typing happens within ~ms)."""
-        if final_tail:
-            shown = (final_tail + " " + draft).strip()
-        else:
-            shown = draft
-        # Strip leading whitespace for a cleaner left edge.
-        self._label.configure(text=shown.lstrip())
-        # Force a geometry recalculation so the strip width tracks text.
-        self._win.update_idletasks()
+    def set_text(self, draft: str) -> None:
+        # Strip leading whitespace — Parakeet often emits a leading space
+        # at sentence start, which looks ugly pinned to the strip's left.
+        self._label.configure(text=draft.lstrip())
+        # Single update + reposition. set_text fires up to 30 Hz so we
+        # avoid back-to-back update_idletasks() calls.
         self._reposition()
 
     def _reposition(self) -> None:

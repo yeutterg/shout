@@ -4,7 +4,7 @@ The `Streamer` owns one StreamingParakeet for the duration of a single
 PTT session. Audio capture (sounddevice InputStream) runs on PortAudio's
 internal thread; chunks are drained into MLX inside `tick()`, which
 should be called from the daemon's worker thread on a steady cadence
-(every ~100 ms). Each tick returns a `Frame` describing what's newly
+(every ~33 ms). Each tick returns a `Frame` describing what's newly
 finalized and what the current draft (still-being-revised) text is.
 
 The driver (daemon) is responsible for:
@@ -18,7 +18,6 @@ The driver (daemon) is responsible for:
 from __future__ import annotations
 
 import queue
-import threading
 from dataclasses import dataclass
 from typing import Optional
 
@@ -26,9 +25,9 @@ import mlx.core as mx
 import numpy as np
 import sounddevice as sd
 
-# We hard-code the audio config to what Parakeet expects. mlx-community
-# Parakeet TDT 0.6B v3 uses 16 kHz mono. Reading these from the model at
-# session start would be cleaner but adds an indirection without value.
+# Parakeet TDT 0.6B v3 expects 16 kHz mono float32. Reading these from
+# the model at session start would be cleaner but adds an indirection
+# without value (parakeet-mlx v3 is the one supported model).
 _SAMPLE_RATE = 16_000
 _CHANNELS = 1
 _BLOCKSIZE = 1_600  # 100 ms at 16 kHz
@@ -62,10 +61,16 @@ class Streamer:
         self._audio_q: queue.Queue[np.ndarray] = queue.Queue()
         self._sd_stream: Optional[sd.InputStream] = None
         self._finalized_emitted_count = 0
-        self._lock = threading.Lock()
+        self._started = False
 
     def start(self) -> None:
-        """Open audio device and start the streaming context."""
+        """Open audio device and start the streaming context.
+
+        A Streamer instance is single-use; calling start() twice raises."""
+        if self._started:
+            raise RuntimeError("Streamer.start() may only be called once")
+        self._started = True
+
         self._stream_ctx = self._model.transcribe_stream(
             context_size=self._context_size
         )
@@ -121,8 +126,7 @@ class Streamer:
         # On end-of-session, treat any remaining draft text as final —
         # the user has stopped speaking, so there are no more revisions
         # coming. This is the v0 "final flush" behavior.
-        with self._lock:
-            draft = self._render_draft()
+        draft = self._render_draft()
 
         # Close the streaming context (frees MLX caches).
         if self._stream_ctx is not None:
@@ -136,9 +140,11 @@ class Streamer:
         )
 
     def _build_frame(self) -> Frame:
-        with self._lock:
-            finalized_tokens = list(self._streamer.finalized_tokens)
-            draft_tokens = list(self._streamer.draft_tokens)
+        # Single-threaded: tick() (and therefore _build_frame) is only
+        # called from the daemon's worker thread, which also owns
+        # add_audio. No locking needed.
+        finalized_tokens = list(self._streamer.finalized_tokens)
+        draft_tokens = list(self._streamer.draft_tokens)
 
         new_finalized = finalized_tokens[self._finalized_emitted_count :]
         self._finalized_emitted_count = len(finalized_tokens)

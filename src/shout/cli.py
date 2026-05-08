@@ -26,12 +26,17 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("quit", help="Ask the daemon to shut down")
 
     p_setup = sub.add_parser(
-        "setup", help="Install Hammerspoon + Karabiner configs and the launch agent"
+        "setup", help="Install the Hammerspoon Lua and Karabiner rule"
     )
+    # Default: do NOT install our launchagent. brew services start shout
+    # is the conventional path and creates its own homebrew.mxcl.shout
+    # plist; if our plist is also installed, both daemons race to bind
+    # the same Unix socket. Opt in only when running outside of brew.
     p_setup.add_argument(
-        "--no-launchagent",
+        "--launchagent",
         action="store_true",
-        help="Skip installing the launch agent (use brew services instead)",
+        help="Also install ~/Library/LaunchAgents/com.greg.shout.plist "
+        "(skip when using `brew services start shout`)",
     )
 
     sub.add_parser("doctor", help="Print a diagnostic of the install")
@@ -46,7 +51,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd in ("start", "stop", "ping", "quit"):
         return _send(args.cmd)
     if args.cmd == "setup":
-        return _setup(install_launchagent=not args.no_launchagent)
+        return _setup(install_launchagent=args.launchagent)
     if args.cmd == "doctor":
         return _doctor()
     if args.cmd == "bench":
@@ -74,6 +79,7 @@ def _send(cmd: str) -> int:
 def _setup(install_launchagent: bool) -> int:
     paths.ensure_app_support()
     installed: list[str] = []
+    warnings: list[str] = []
 
     karabiner_dst_dir = paths.karabiner_complex_mods_dir()
     if karabiner_dst_dir.parent.parent.exists():
@@ -83,10 +89,10 @@ def _setup(install_launchagent: bool) -> int:
         shutil.copy(karabiner_src, karabiner_dst)
         installed.append(f"karabiner rule  → {karabiner_dst}")
     else:
-        print(
-            "Karabiner-Elements is not installed. Run "
-            "`brew install --cask karabiner-elements` first.",
-            file=sys.stderr,
+        warnings.append(
+            "Karabiner-Elements is not installed (or has never been "
+            "launched). Run `brew install --cask karabiner-elements`, "
+            "open Karabiner once, then re-run `shout setup`."
         )
 
     hs_dir = paths.hammerspoon_config_dir()
@@ -108,9 +114,6 @@ def _setup(install_launchagent: bool) -> int:
         agent_src = _resource_path("launchd", "com.greg.shout.plist")
         agent_dst = paths.launch_agent_path()
         agent_dst.parent.mkdir(parents=True, exist_ok=True)
-        # Substitute the absolute path to `shout` so the agent works
-        # whether installed via brew (/opt/homebrew/bin/shout) or via
-        # uv tool install (~/.local/bin/shout).
         text = Path(agent_src).read_text().replace(
             "{{SHOUT_BIN}}", _shout_binary_path()
         )
@@ -120,15 +123,20 @@ def _setup(install_launchagent: bool) -> int:
     print("Installed:")
     for line in installed:
         print(f"  {line}")
+    if warnings:
+        print()
+        print("Warnings:")
+        for w in warnings:
+            print(f"  ! {w}")
     print()
     print("Next steps:")
     print("  1. Open Karabiner-Elements → Complex Modifications → Add rule →")
     print("     enable 'Shout: Caps Lock → F19 (push-to-talk)'.")
     print("  2. Reload Hammerspoon (menu bar → Reload Config).")
     print("  3. Grant the Shout daemon permissions (System Settings → Privacy):")
-    print("     • Microphone")
-    print("     • Accessibility (for typing at cursor)")
-    print("     • Input Monitoring (for hotkey)")
+    print("     • Microphone        — for the daemon's Python interpreter")
+    print("     • Accessibility     — for typing at the cursor")
+    print("     • Input Monitoring  — for Hammerspoon (the F19 listener)")
     if install_launchagent:
         print("  4. Start the daemon:")
         print(f"     launchctl load {paths.launch_agent_path()}")
@@ -144,6 +152,18 @@ def _doctor() -> int:
     def check(label: str, ok: bool, detail: str = "") -> None:
         mark = "✓" if ok else "✗"
         rows.append((mark, label, detail))
+
+    # tkinter is bundled with stock Python builds but Homebrew's
+    # python@3.12 ships without it (python-tk@3.12 is a separate formula).
+    try:
+        import tkinter  # noqa: F401
+
+        tk_ok = True
+        tk_detail = ""
+    except ImportError as e:
+        tk_ok = False
+        tk_detail = f"({e})"
+    check("tkinter importable", tk_ok, tk_detail)
 
     check(
         "Karabiner-Elements installed",
@@ -164,12 +184,6 @@ def _doctor() -> int:
     init_lua = paths.hammerspoon_config_dir() / "init.lua"
     init_ok = init_lua.exists() and 'require("shout")' in init_lua.read_text()
     check("Hammerspoon init.lua requires shout", init_ok, str(init_lua))
-
-    check(
-        "Launch agent installed",
-        paths.launch_agent_path().exists(),
-        str(paths.launch_agent_path()),
-    )
 
     socket_alive = False
     try:

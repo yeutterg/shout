@@ -58,9 +58,13 @@ class Shout < Formula
 
   service do
     run [opt_bin/"shout", "daemon"]
+    # Restart only on non-zero exit (model-load failure, crash). Clean
+    # `shout quit` is exit 0 and stays down.
     keep_alive successful_exit: false
-    log_path "/tmp/shout.out.log"
-    error_log_path "/tmp/shout.err.log"
+    log_path "#{Dir.home}/Library/Logs/Shout/daemon.out.log"
+    error_log_path "#{Dir.home}/Library/Logs/Shout/daemon.err.log"
+    # Interactive lets the daemon render UI in the user's Aqua session
+    # (the floating overlay window).
     process_type :interactive
   end
 
@@ -72,18 +76,28 @@ class Shout < Formula
 
         brew install --cask karabiner-elements hammerspoon
 
-      Then wire up the configs and grant the daemon permissions:
+      Then wire up the configs:
 
         shout setup
-        # System Settings → Privacy & Security:
-        #   - Microphone        → enable for Python (or for the daemon)
-        #   - Accessibility     → enable (for typing at cursor)
-        #   - Input Monitoring  → enable for Hammerspoon
-        shout doctor
+        # `shout setup` does NOT install a launch agent, because
+        # `brew services start shout` already creates one. If you want
+        # to manage the daemon outside brew, run `shout setup --launchagent`.
 
       Start the daemon:
 
         brew services start shout
+
+      First time only, macOS will prompt to grant the daemon and
+      Hammerspoon these permissions (System Settings → Privacy & Security):
+
+        • Microphone       — for the daemon (the brew-installed Python)
+        • Accessibility    — for the daemon (so it can type at the cursor)
+        • Input Monitoring — for Hammerspoon (so it can listen for F19)
+
+      The daemon's binary path is:
+        #{HOMEBREW_PREFIX}/opt/shout/libexec/venv/bin/python3.12
+
+      Run `shout doctor` once everything is in place.
     EOS
   end
 

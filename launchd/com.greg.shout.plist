@@ -15,19 +15,26 @@
   <key>RunAtLoad</key>
   <true/>
 
+  <!-- KeepAlive.SuccessfulExit=false means: relaunch on non-zero exit
+       (crash, model-load failure), but stay down on a clean `shout
+       quit`. Pairs with the daemon's exit-code policy in daemon.py. -->
   <key>KeepAlive</key>
   <dict>
     <key>SuccessfulExit</key>
     <false/>
   </dict>
 
+  <!-- Interactive: daemon renders UI in the user's Aqua session
+       (the floating overlay). -->
   <key>ProcessType</key>
   <string>Interactive</string>
 
+  <!-- macOS periodically cleans /tmp on reboot, so logs go to a
+       persistent location under ~/Library/Logs/. -->
   <key>StandardOutPath</key>
-  <string>/tmp/shout.out.log</string>
+  <string>{{HOME}}/Library/Logs/Shout/daemon.out.log</string>
   <key>StandardErrorPath</key>
-  <string>/tmp/shout.err.log</string>
+  <string>{{HOME}}/Library/Logs/Shout/daemon.err.log</string>
 
   <!-- Throttle restart attempts so a crash loop does not eat CPU. -->
   <key>ThrottleInterval</key>
