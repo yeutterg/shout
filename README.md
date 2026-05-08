@@ -76,7 +76,13 @@ shout setup
 brew services start shout
 ```
 
-`shout setup` copies the Karabiner rule, the Hammerspoon Lua, and appends `require("shout")` to `~/.hammerspoon/init.lua`. It does NOT install a launch agent — `brew services` handles that. (Use `shout setup --launchagent` only when running outside brew.)
+`shout setup`:
+
+- copies the Karabiner rule under `~/.config/karabiner/assets/complex_modifications/`,
+- patches `~/.config/karabiner/karabiner.json` to enable that rule in the active profile (creating the file with sensible defaults if Karabiner-Elements has not yet been opened to its Settings window),
+- copies `shout.lua` to `~/.hammerspoon/` and appends `require("shout")` to `~/.hammerspoon/init.lua`.
+
+It does NOT install a launch agent — `brew services` handles that. (Use `shout setup --launchagent` only when running outside brew.)
 
 ### Permissions (one-time)
 
@@ -84,14 +90,16 @@ brew services start shout
 | --- | --- | --- | --- |
 | Microphone | the brew-installed Python (`/opt/homebrew/opt/shout/libexec/venv/bin/python3.12`) | sounddevice mic capture | macOS prompts on first PTT |
 | Accessibility | same Python binary | Quartz CGEvent typing at cursor | System Settings → Privacy & Security → Accessibility → `+` → ⌘⇧G to paste the path above |
-| Input Monitoring | Hammerspoon | listens for F19 | macOS prompts on Hammerspoon launch |
-| System Extension | Karabiner-Elements | Caps Lock → F19 HID-layer remap | Karabiner prompts on first launch |
+| Accessibility | Hammerspoon | so it can synthesize a real Caps Lock keystroke on triple-tap | macOS prompts on first Hammerspoon launch |
+| System extensions + Background activity | Karabiner-Elements | Caps Lock → F19 HID-layer remap | see Karabiner section above |
 
-After granting Accessibility manually, **restart the daemon** so it inherits the new permission: `brew services restart shout`.
+After granting Accessibility to the Shout daemon manually, **restart the daemon** so it inherits the new permission: `brew services restart shout`.
 
-Then in Karabiner-Elements: **Complex Modifications** → **Add rule** → enable **"Shout: Caps Lock → F19 (push-to-talk)"**. Reload Hammerspoon (menu bar → Reload Config) so it picks up `shout.lua`.
+Reload Hammerspoon (menu bar icon → Reload Config) so it picks up `shout.lua` (or just open Hammerspoon for the first time — auto-loaded).
 
 Run `shout doctor`. Every check should be ✓.
+
+> Hammerspoon does NOT need Input Monitoring permission for our flow. `hs.hotkey.bind` uses macOS's `RegisterEventHotKey` API, which has no permission requirement; we use `hs.eventtap.keyStroke` for the triple-tap fallback, which only needs Accessibility.
 
 ## CLI
 

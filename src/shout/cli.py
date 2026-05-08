@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 import shutil
@@ -88,6 +89,14 @@ def _setup(install_launchagent: bool) -> int:
         karabiner_dst = karabiner_dst_dir / "shout-caps-to-f19.json"
         shutil.copy(karabiner_src, karabiner_dst)
         installed.append(f"karabiner rule  → {karabiner_dst}")
+        # Also patch the active Karabiner profile so the user does not
+        # have to click through Karabiner UI → Complex Modifications →
+        # Add rule. Karabiner watches karabiner.json with FSEvents and
+        # reloads automatically.
+        kb_config = paths.karabiner_complex_mods_dir().parent.parent / "karabiner.json"
+        action = _enable_karabiner_rule(kb_config, Path(karabiner_src))
+        if action:
+            installed.append(f"karabiner config → {action}")
     else:
         warnings.append(
             "Karabiner-Elements is not installed (or has never been "
@@ -130,19 +139,17 @@ def _setup(install_launchagent: bool) -> int:
             print(f"  ! {w}")
     print()
     print("Next steps:")
-    print("  1. Open Karabiner-Elements → Complex Modifications → Add rule →")
-    print("     enable 'Shout: Caps Lock → F19 (push-to-talk)'.")
-    print("  2. Reload Hammerspoon (menu bar → Reload Config).")
-    print("  3. Grant the Shout daemon permissions (System Settings → Privacy):")
-    print("     • Microphone        — for the daemon's Python interpreter")
-    print("     • Accessibility     — for typing at the cursor")
-    print("     • Input Monitoring  — for Hammerspoon (the F19 listener)")
+    print("  1. Reload Hammerspoon (menu bar icon → Reload Config), then")
+    print("     allow Accessibility when prompted.")
+    print("  2. Grant the Shout daemon permissions (System Settings → Privacy):")
+    print("     • Microphone     — for the daemon's Python interpreter")
+    print("     • Accessibility  — for typing at the cursor")
     if install_launchagent:
-        print("  4. Start the daemon:")
+        print("  3. Start the daemon:")
         print(f"     launchctl load {paths.launch_agent_path()}")
     else:
-        print("  4. Start the daemon: brew services start shout")
-    print("  5. Run `shout doctor` to confirm everything is wired up.")
+        print("  3. Start the daemon: brew services start shout")
+    print("  4. Run `shout doctor` to confirm everything is wired up.")
     return 0
 
 
@@ -176,7 +183,29 @@ def _doctor() -> int:
     karabiner_rule = (
         paths.karabiner_complex_mods_dir() / "shout-caps-to-f19.json"
     )
-    check("Karabiner rule installed", karabiner_rule.exists(), str(karabiner_rule))
+    check("Karabiner rule file present", karabiner_rule.exists(), str(karabiner_rule))
+
+    # The rule file alone is just a library entry; the *active* config
+    # has to also reference it for Karabiner to actually apply it.
+    kb_config = paths.karabiner_complex_mods_dir().parent.parent / "karabiner.json"
+    rule_active = False
+    if kb_config.exists():
+        try:
+            data = json.loads(kb_config.read_text())
+            for prof in data.get("profiles", []):
+                for r in prof.get("complex_modifications", {}).get("rules", []):
+                    if "Shout" in (r.get("description") or ""):
+                        rule_active = True
+                        break
+                if rule_active:
+                    break
+        except json.JSONDecodeError:
+            pass
+    check(
+        "Karabiner rule enabled in active profile",
+        rule_active,
+        str(kb_config) if kb_config.exists() else "(karabiner.json missing)",
+    )
 
     hs_lua = paths.hammerspoon_config_dir() / "shout.lua"
     check("Hammerspoon shout.lua installed", hs_lua.exists(), str(hs_lua))
@@ -203,6 +232,85 @@ def _doctor() -> int:
         return 1
     print("All checks passed.")
     return 0
+
+
+def _enable_karabiner_rule(config_path: Path, rule_file: Path) -> str | None:
+    """Inject our rule into the active Karabiner profile.
+
+    Returns a one-line summary of what changed, or None if the rule was
+    already enabled.
+
+    The rule library file under ~/.config/karabiner/assets/complex_modifications
+    is just an *available* rule — Karabiner doesn't apply rules from
+    there unless they are also present in the active profile's
+    `complex_modifications.rules` list (which is what the UI's
+    "Add rule" button does behind the scenes).
+
+    If `karabiner.json` does not yet exist (the user hasn't opened
+    Karabiner-Elements Settings to create it), we write a minimal
+    default config with our rule pre-enabled. If it does exist, we
+    patch the selected profile in place, deduplicating by rule
+    description.
+    """
+    rule_doc = json.loads(rule_file.read_text())
+    new_rules = rule_doc.get("rules", [])
+    if not new_rules:
+        return None
+
+    if config_path.exists():
+        config = json.loads(config_path.read_text())
+        action = "patched"
+    else:
+        config = _karabiner_default_config()
+        action = "created"
+
+    profiles = config.setdefault("profiles", [])
+    if not profiles:
+        profiles.append(_karabiner_default_profile())
+
+    target = next((p for p in profiles if p.get("selected")), profiles[0])
+    cm = target.setdefault("complex_modifications", {"rules": []})
+    cm.setdefault("rules", [])
+
+    existing_descs = {r.get("description") for r in cm["rules"]}
+    added = []
+    for r in new_rules:
+        if r.get("description") in existing_descs:
+            continue
+        cm["rules"].append(copy.deepcopy(r))
+        added.append(r.get("description", "(no description)"))
+
+    if not added and action == "patched":
+        return None
+
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(json.dumps(config, indent=4) + "\n")
+    if added:
+        return f"{action} {config_path} (enabled: {', '.join(added)})"
+    return f"{action} {config_path}"
+
+
+def _karabiner_default_profile() -> dict:
+    return {
+        "name": "Default profile",
+        "selected": True,
+        "complex_modifications": {"rules": []},
+        "simple_modifications": [],
+        "fn_function_keys": [],
+        "devices": [],
+        "virtual_hid_keyboard": {"country_code": 0},
+    }
+
+
+def _karabiner_default_config() -> dict:
+    return {
+        "profiles": [_karabiner_default_profile()],
+        "global": {
+            "check_for_updates_on_startup": True,
+            "show_in_menu_bar": True,
+            "show_profile_name_in_menu_bar": False,
+        },
+    }
 
 
 def _bench() -> int:
