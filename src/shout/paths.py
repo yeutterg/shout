@@ -19,15 +19,13 @@ def ensure_app_support() -> Path:
     return APP_SUPPORT
 
 
-def hammerspoon_config_dir() -> Path:
-    return Path(os.path.expanduser("~/.hammerspoon"))
-
-
-def karabiner_complex_mods_dir() -> Path:
-    return Path(
-        os.path.expanduser("~/.config/karabiner/assets/complex_modifications")
-    )
-
-
 def launch_agent_path() -> Path:
     return Path(os.path.expanduser("~/Library/LaunchAgents/com.greg.shout.plist"))
+
+
+def capslock_remap_agent_path() -> Path:
+    return Path(
+        os.path.expanduser(
+            "~/Library/LaunchAgents/com.greg.shout.capslock-remap.plist"
+        )
+    )

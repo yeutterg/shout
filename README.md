@@ -13,17 +13,16 @@ v0. Apple Silicon only. English + ~24 other European languages with auto-detect 
 ## How it works
 
 ```
-Caps Lock hold    →  Karabiner: Caps Lock → F19  →  Hammerspoon F19 down
-                                                          ↓
-                                                    `shout start` over Unix socket
-                                                          ↓
-                                                    Shout daemon: open mic,
-                                                    feed parakeet-mlx,
-                                                    type finalized tokens at cursor,
-                                                    show drafts in floating overlay
-Caps Lock release →  Hammerspoon F19 up  →  `shout stop`
-Caps Lock 3× tap  →  Hammerspoon synthesizes a real Caps Lock keystroke
-                       (passes above Karabiner's HID layer; OS toggles state, LED lights)
+Caps Lock hold    →  hidutil: Caps Lock → F19 (HID-layer remap, no daemon)
+                                       ↓
+                                Shout daemon Quartz event tap fires;
+                                worker opens mic, feeds parakeet-mlx,
+                                types finalized tokens at cursor,
+                                shows rolling history+draft in floating overlay
+Caps Lock release →  daemon ends session, flushes any unfinalized text
+Caps Lock 3× tap  →  daemon synthesizes a real Caps Lock keystroke
+                       (CGEventPost bypasses the hidutil remap;
+                        OS toggles state, LED lights)
 ```
 
 The daemon stays loaded in memory (the Parakeet model takes ~1.3 s to load and ~2 GB of RAM). Each push-to-talk session reuses the loaded model, so there is no per-session warm-up delay — typically <1 s from speech to first finalized token.
@@ -36,70 +35,34 @@ Shout is distributed as a Homebrew formula. v0.1.0 is not yet tagged with a stab
 brew tap yeutterg/shout https://github.com/yeutterg/shout
 brew install --HEAD yeutterg/shout/shout
 
-# Hammerspoon (no sudo needed):
-brew install --cask hammerspoon
-```
-
-### Karabiner-Elements requires an interactive sudo prompt
-
-The `karabiner-elements` cask installs a system extension and **requires `sudo` from a real terminal** — Homebrew shells out to `/usr/sbin/installer`, which fails with `sudo: a terminal is required to read the password` if invoked from a non-TTY context (a Claude Code `! command` prompt, an editor task runner, a `launchctl`-spawned shell, etc.).
-
-Pick whichever path is convenient:
-
-```bash
-# Option A — from a real terminal (Terminal.app, iTerm2, Ghostty, …)
-brew install --cask karabiner-elements
-# sudo will prompt; type your password.
-
-# Option B — let macOS's GUI installer prompt for the password
-# Homebrew's `--cask` step downloads the .pkg even when the install fails;
-# you can run it directly:
-open /opt/homebrew/Caskroom/karabiner-elements/*/Karabiner-Elements.pkg
-```
-
-### First launch of Karabiner-Elements
-
-Open Karabiner-Elements once from Spotlight. Karabiner uses a daemon-plus-helper architecture and asks for permissions in three separate places. Approve them all:
-
-1. **Accessibility popup for `Karabiner-Core-Service.app`.** Click "Open System Settings" → enable the toggle for Karabiner-Core-Service.
-2. **Karabiner-Elements Settings → "Background services"** wizard. Click through to choose background services. This kicks you into System Settings.
-3. **System Settings → General → Login Items & Extensions** → under "Allow in the Background", enable both:
-   - `Karabiner-Elements Non-Privileged Agents v2.app`
-   - `Karabiner-Elements Privileged Daemons v2.app`
-
-Without all three, the Caps Lock → F19 remap silently does nothing. After Karabiner is fully approved, `~/.config/karabiner/` exists and `shout setup` can drop the rule in.
-
-### Wire up the configs and start the daemon
-
-```bash
 shout setup
 brew services start shout
 ```
 
-`shout setup`:
+That's it for installation. **No Karabiner. No Hammerspoon.** `shout setup`:
 
-- copies the Karabiner rule under `~/.config/karabiner/assets/complex_modifications/`,
-- patches `~/.config/karabiner/karabiner.json` to enable that rule in the active profile (creating the file with sensible defaults if Karabiner-Elements has not yet been opened to its Settings window),
-- copies `shout.lua` to `~/.hammerspoon/` and appends `require("shout")` to `~/.hammerspoon/init.lua`.
+- runs `hidutil` to remap Caps Lock → F19 in the current session,
+- writes a small LaunchAgent to re-apply that remap at every login.
 
-It does NOT install a launch agent — `brew services` handles that. (Use `shout setup --launchagent` only when running outside brew.)
+The Shout daemon does the rest: it watches for F19 via a Quartz event tap, opens the mic, runs streaming inference, types text at the cursor, and shows a rolling overlay with the most recent finalized text plus the current draft.
 
 ### Permissions (one-time)
 
-| Permission | Granted to | Why | How |
-| --- | --- | --- | --- |
-| Microphone | the brew-installed Python (`/opt/homebrew/opt/shout/libexec/venv/bin/python3.12`) | sounddevice mic capture | macOS prompts on first PTT |
-| Accessibility | same Python binary | Quartz CGEvent typing at cursor | System Settings → Privacy & Security → Accessibility → `+` → ⌘⇧G to paste the path above |
-| Accessibility | Hammerspoon | so it can synthesize a real Caps Lock keystroke on triple-tap | macOS prompts on first Hammerspoon launch |
-| System extensions + Background activity | Karabiner-Elements | Caps Lock → F19 HID-layer remap | see Karabiner section above |
+The daemon's Python interpreter (`/opt/homebrew/opt/shout/libexec/venv/bin/python3.12`) needs two permissions in System Settings → Privacy & Security:
 
-After granting Accessibility to the Shout daemon manually, **restart the daemon** so it inherits the new permission: `brew services restart shout`.
+| Permission | Why |
+| --- | --- |
+| Microphone | sounddevice mic capture |
+| Accessibility | Quartz CGEvent typing at cursor **and** the F19 event tap |
 
-Reload Hammerspoon (menu bar icon → Reload Config) so it picks up `shout.lua` (or just open Hammerspoon for the first time — auto-loaded).
+The Microphone prompt typically pops on first hold. Accessibility usually has to be added by hand:
 
-Run `shout doctor`. Every check should be ✓.
+1. System Settings → Privacy & Security → Accessibility → click `+`
+2. ⌘⇧G → paste `/opt/homebrew/opt/shout/libexec/venv/bin/python3.12`
+3. Add it, toggle it on
+4. `brew services restart shout` so the daemon inherits the new permission
 
-> Hammerspoon does NOT need Input Monitoring permission for our flow. `hs.hotkey.bind` uses macOS's `RegisterEventHotKey` API, which has no permission requirement; we use `hs.eventtap.keyStroke` for the triple-tap fallback, which only needs Accessibility.
+Then run `shout doctor`. Every check should be ✓.
 
 ## CLI
 
@@ -109,7 +72,7 @@ shout start     # ask the running daemon to begin a PTT session
 shout stop      # ask the running daemon to end the current session
 shout ping      # health check; reports whether the model is loaded
 shout quit      # ask the daemon to shut down
-shout setup     # copy the Karabiner rule + Hammerspoon Lua + launchd plist into place
+shout setup     # apply hidutil remap + install LaunchAgent
 shout doctor    # diagnose the install
 shout bench     # run the cold-start benchmark (development only)
 ```
@@ -117,6 +80,10 @@ shout bench     # run the cold-start benchmark (development only)
 ## Architecture decisions
 
 **Why a long-running daemon, not spawn-per-session.** Cold-start of a fresh Python interpreter + parakeet-mlx import + model load + first MLX encoder pass measured 2.3 – 4.4 seconds (`scripts/bench-cold-start.py`). That's well over the v0 acceptance criterion of <1.5 s, so the daemon variant won. Trade-off: ~2 GB resident RAM while idle.
+
+**Why hidutil, not Karabiner.** Original design used Karabiner-Elements to remap Caps Lock → F19. Karabiner v15+ uses Apple's `SMAppService` API for its privileged daemon registration; the user has to approve a system extension in Privacy & Security AND toggle two background-activity entries in Login Items & Extensions, and even then DriverKit activation can stall. Apple's built-in `hidutil` does the same HID-layer remap with one shell command and zero permissions. We re-apply it at login via a tiny LaunchAgent.
+
+**Why no Hammerspoon either.** Original design used Hammerspoon to bind F19 hold/release and to detect triple-tap for the real-CapsLock fallback. The Shout daemon already needs Accessibility permission for Quartz CGEvent typing — that same permission lets us tap F19 directly via `Quartz.CGEventTapCreate`. One process, one permission grant, no Lua, no `init.lua` append.
 
 **Why `(256, 8)` for `context_size`, not `(256, 0)`.** The original PRD asked for zero right-context (lowest possible latency). `parakeet-mlx ≥ 0.5` rejects a zero right-context. With 8 encoder frames (~640 ms) of right context the streamer still finalizes well inside the 1.5 s budget while leaving enough lookahead to keep finalization stable.
 
@@ -135,15 +102,16 @@ shout/
 ├── scripts/bench-cold-start.py   Latency benchmark
 ├── src/shout/
 │   ├── cli.py                    `shout` argv dispatch + setup/doctor
-│   ├── daemon.py                 Long-running daemon (Tk + worker + socket)
+│   ├── daemon.py                 Long-running daemon (Tk + worker + socket + hotkey threads)
+│   ├── hotkey.py                 Quartz CGEventTap for F19 + triple-tap → real Caps Lock
 │   ├── stream.py                 parakeet-mlx + sounddevice loop
 │   ├── inject.py                 Quartz CGEvent unicode keystrokes
-│   ├── overlay.py                Tkinter floating overlay
+│   ├── overlay.py                Tkinter floating overlay (rolling history + draft)
 │   ├── protocol.py               Tiny line-JSON protocol over Unix socket
 │   └── paths.py                  Filesystem locations
-├── hammerspoon/shout.lua         F19 hold/release + triple-tap → real CapsLock
-├── karabiner/caps-to-f19.json    Complex-modification rule
-└── launchd/com.greg.shout.plist  Login-agent template (substituted by setup)
+└── launchd/
+    ├── com.greg.shout.plist               Login-agent template (substituted by `shout setup --launchagent`)
+    └── com.greg.shout.capslock-remap.plist Login-agent that runs `hidutil` to apply Caps Lock → F19
 ```
 
 ## Development
@@ -170,7 +138,7 @@ uv run python scripts/bench-cold-start.py --runs 5 --output bench-results/cold-s
 
 ## Roadmap
 
-This README covers v0 (Track 1 of the broader voice stack). The full plan — including Anarlog plugins for meeting transcription — lives in the PRD ([Voice Stack: Parakeet + Anarlog Plugins](https://github.com/yeutterg/shout/blob/master/docs/PRD.md), or whatever path the user resolves to). v1 polish layer: Swift menubar wrapper around the same Python inference subprocess, with NSPanel replacing Tk and the modern `KeyboardShortcuts` Swift package replacing Hammerspoon.
+This README covers v0 (Track 1 of the broader voice stack). The full plan — including Anarlog plugins for meeting transcription — lives in the PRD ([Voice Stack: Parakeet + Anarlog Plugins](https://github.com/yeutterg/shout/blob/master/docs/PRD.md), or whatever path the user resolves to). v1 polish layer: Swift menubar wrapper around the same Python inference subprocess, with NSPanel replacing Tk and a native menubar app replacing this Python event-tap.
 
 ## License
 

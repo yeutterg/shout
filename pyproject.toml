@@ -26,9 +26,8 @@ build-backend = "hatchling.build"
 packages = ["src/shout"]
 
 [tool.hatch.build.targets.wheel.force-include]
-"hammerspoon/shout.lua" = "shout/_resources/hammerspoon/shout.lua"
-"karabiner/caps-to-f19.json" = "shout/_resources/karabiner/caps-to-f19.json"
 "launchd/com.greg.shout.plist" = "shout/_resources/launchd/com.greg.shout.plist"
+"launchd/com.greg.shout.capslock-remap.plist" = "shout/_resources/launchd/com.greg.shout.capslock-remap.plist"
 
 [dependency-groups]
 dev = [

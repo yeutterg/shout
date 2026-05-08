@@ -70,34 +70,26 @@ class Shout < Formula
 
   def caveats
     <<~EOS
-      Shout needs two GUI apps for the push-to-talk hotkey path. They are
-      not formula dependencies because casks cannot be required from
-      formulas, so install them manually:
-
-        brew install --cask karabiner-elements hammerspoon
-
-      Then wire up the configs:
+      Apply the Caps Lock → F19 remap (and persist it as a login agent),
+      then start the daemon:
 
         shout setup
-        # `shout setup` does NOT install a launch agent, because
-        # `brew services start shout` already creates one. If you want
-        # to manage the daemon outside brew, run `shout setup --launchagent`.
-
-      Start the daemon:
-
         brew services start shout
 
-      First time only, macOS will prompt to grant the daemon and
-      Hammerspoon these permissions (System Settings → Privacy & Security):
+      First time only, macOS will prompt for two permissions on the
+      daemon's Python interpreter
+      (#{HOMEBREW_PREFIX}/opt/shout/libexec/venv/bin/python3.12):
 
-        • Microphone       — for the daemon (the brew-installed Python)
-        • Accessibility    — for the daemon (so it can type at the cursor)
-        • Input Monitoring — for Hammerspoon (so it can listen for F19)
+        • Microphone     — sounddevice mic capture
+        • Accessibility  — both for typing at the cursor AND for the
+                           F19 event tap
 
-      The daemon's binary path is:
-        #{HOMEBREW_PREFIX}/opt/shout/libexec/venv/bin/python3.12
+      System Settings → Privacy & Security → Accessibility → `+` →
+      ⌘⇧G → paste the path above. Then:
 
-      Run `shout doctor` once everything is in place.
+        brew services restart shout
+
+      Run `shout doctor` to confirm. Hold Caps Lock and start dictating.
     EOS
   end
 

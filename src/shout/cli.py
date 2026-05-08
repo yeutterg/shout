@@ -3,16 +3,29 @@
 from __future__ import annotations
 
 import argparse
-import copy
 import json
 import os
 import shutil
 import socket
+import subprocess
 import sys
 from importlib import resources
 from pathlib import Path
 
 from . import paths, protocol
+
+
+# The Caps Lock → F19 hidutil mapping. HID Usage Page 7 (Keyboard) +
+# usage code: 0x39 = Caps Lock, 0x6E = F19. Apple's hidutil represents
+# the (page, code) pair as one 64-bit integer with the page in the high
+# half. These constants must agree with the values baked into
+# launchd/com.greg.shout.capslock-remap.plist.
+_HIDUTIL_CAPS_TO_F19 = (
+    '{"UserKeyMapping":[{"HIDKeyboardModifierMappingSrc":0x700000039,'
+    '"HIDKeyboardModifierMappingDst":0x70000006E}]}'
+)
+_HID_CAPS_LOCK_DEC = 30064771129  # 0x700000039
+_HID_F19_DEC = 30064771182  # 0x70000006E
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -27,17 +40,15 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("quit", help="Ask the daemon to shut down")
 
     p_setup = sub.add_parser(
-        "setup", help="Install the Hammerspoon Lua and Karabiner rule"
+        "setup",
+        help="Remap Caps Lock → F19 (hidutil), install Hammerspoon Lua, "
+        "and persist the remap as a login-time LaunchAgent",
     )
-    # Default: do NOT install our launchagent. brew services start shout
-    # is the conventional path and creates its own homebrew.mxcl.shout
-    # plist; if our plist is also installed, both daemons race to bind
-    # the same Unix socket. Opt in only when running outside of brew.
     p_setup.add_argument(
         "--launchagent",
         action="store_true",
-        help="Also install ~/Library/LaunchAgents/com.greg.shout.plist "
-        "(skip when using `brew services start shout`)",
+        help="Also install ~/Library/LaunchAgents/com.greg.shout.plist for "
+        "the daemon (skip when using `brew services start shout`)",
     )
 
     sub.add_parser("doctor", help="Print a diagnostic of the install")
@@ -80,45 +91,43 @@ def _send(cmd: str) -> int:
 def _setup(install_launchagent: bool) -> int:
     paths.ensure_app_support()
     installed: list[str] = []
-    warnings: list[str] = []
 
-    karabiner_dst_dir = paths.karabiner_complex_mods_dir()
-    if karabiner_dst_dir.parent.parent.exists():
-        karabiner_dst_dir.mkdir(parents=True, exist_ok=True)
-        karabiner_src = _resource_path("karabiner", "caps-to-f19.json")
-        karabiner_dst = karabiner_dst_dir / "shout-caps-to-f19.json"
-        shutil.copy(karabiner_src, karabiner_dst)
-        installed.append(f"karabiner rule  → {karabiner_dst}")
-        # Also patch the active Karabiner profile so the user does not
-        # have to click through Karabiner UI → Complex Modifications →
-        # Add rule. Karabiner watches karabiner.json with FSEvents and
-        # reloads automatically.
-        kb_config = paths.karabiner_complex_mods_dir().parent.parent / "karabiner.json"
-        action = _enable_karabiner_rule(kb_config, Path(karabiner_src))
-        if action:
-            installed.append(f"karabiner config → {action}")
-    else:
-        warnings.append(
-            "Karabiner-Elements is not installed (or has never been "
-            "launched). Run `brew install --cask karabiner-elements`, "
-            "open Karabiner once, then re-run `shout setup`."
+    # 1. Apply the hidutil remap right now so the Caps Lock → F19 path
+    #    is live in the current session — no logout required. The
+    #    LaunchAgent below makes it stick across reboots.
+    try:
+        subprocess.run(
+            ["/usr/bin/hidutil", "property", "--set", _HIDUTIL_CAPS_TO_F19],
+            check=True,
+            capture_output=True,
         )
+        installed.append("hidutil mapping → caps_lock → f19 (active now)")
+    except subprocess.CalledProcessError as e:
+        print(
+            f"hidutil failed: {e.stderr.decode().strip()}",
+            file=sys.stderr,
+        )
+        return 1
 
-    hs_dir = paths.hammerspoon_config_dir()
-    hs_dir.mkdir(parents=True, exist_ok=True)
-    hs_src = _resource_path("hammerspoon", "shout.lua")
-    hs_dst = hs_dir / "shout.lua"
-    shutil.copy(hs_src, hs_dst)
-    installed.append(f"hammerspoon lua → {hs_dst}")
+    # 2. Drop a LaunchAgent that re-applies the mapping at every login.
+    remap_agent_dst = paths.capslock_remap_agent_path()
+    remap_agent_dst.parent.mkdir(parents=True, exist_ok=True)
+    remap_agent_src = _resource_path(
+        "launchd", "com.greg.shout.capslock-remap.plist"
+    )
+    shutil.copy(remap_agent_src, remap_agent_dst)
+    # Reload it if already present so a config change takes effect.
+    subprocess.run(
+        ["/bin/launchctl", "unload", str(remap_agent_dst)],
+        capture_output=True,
+    )
+    subprocess.run(
+        ["/bin/launchctl", "load", str(remap_agent_dst)],
+        capture_output=True,
+    )
+    installed.append(f"capslock LaunchAgent → {remap_agent_dst}")
 
-    init_lua = hs_dir / "init.lua"
-    require_line = 'require("shout")\n'
-    if not init_lua.exists() or require_line.strip() not in init_lua.read_text():
-        with init_lua.open("a") as f:
-            f.write("\n-- Added by `shout setup`\n")
-            f.write(require_line)
-        installed.append(f"hammerspoon init → appended require to {init_lua}")
-
+    # 3. Optional daemon launch agent for non-brew installs.
     if install_launchagent:
         agent_src = _resource_path("launchd", "com.greg.shout.plist")
         agent_dst = paths.launch_agent_path()
@@ -127,29 +136,23 @@ def _setup(install_launchagent: bool) -> int:
             "{{SHOUT_BIN}}", _shout_binary_path()
         )
         agent_dst.write_text(text)
-        installed.append(f"launch agent    → {agent_dst}")
+        installed.append(f"daemon LaunchAgent  → {agent_dst}")
 
     print("Installed:")
     for line in installed:
         print(f"  {line}")
-    if warnings:
-        print()
-        print("Warnings:")
-        for w in warnings:
-            print(f"  ! {w}")
     print()
     print("Next steps:")
-    print("  1. Reload Hammerspoon (menu bar icon → Reload Config), then")
-    print("     allow Accessibility when prompted.")
-    print("  2. Grant the Shout daemon permissions (System Settings → Privacy):")
-    print("     • Microphone     — for the daemon's Python interpreter")
-    print("     • Accessibility  — for typing at the cursor")
+    print("  1. Grant the Shout daemon permissions (System Settings → Privacy):")
+    print("     • Microphone     — sounddevice mic capture")
+    print("     • Accessibility  — both for typing at the cursor AND for")
+    print("                        the F19 event tap")
     if install_launchagent:
-        print("  3. Start the daemon:")
+        print("  2. Start the daemon:")
         print(f"     launchctl load {paths.launch_agent_path()}")
     else:
-        print("  3. Start the daemon: brew services start shout")
-    print("  4. Run `shout doctor` to confirm everything is wired up.")
+        print("  2. Start the daemon: brew services start shout")
+    print("  3. Run `shout doctor` to confirm everything is wired up.")
     return 0
 
 
@@ -172,47 +175,17 @@ def _doctor() -> int:
         tk_detail = f"({e})"
     check("tkinter importable", tk_ok, tk_detail)
 
-    check(
-        "Karabiner-Elements installed",
-        Path("/Applications/Karabiner-Elements.app").exists(),
-    )
-    check(
-        "Hammerspoon installed",
-        Path("/Applications/Hammerspoon.app").exists(),
-    )
-    karabiner_rule = (
-        paths.karabiner_complex_mods_dir() / "shout-caps-to-f19.json"
-    )
-    check("Karabiner rule file present", karabiner_rule.exists(), str(karabiner_rule))
+    # Caps Lock → F19 hidutil remap currently active?
+    remap_active, remap_detail = _hidutil_caps_to_f19_active()
+    check("hidutil caps_lock → f19 active", remap_active, remap_detail)
 
-    # The rule file alone is just a library entry; the *active* config
-    # has to also reference it for Karabiner to actually apply it.
-    kb_config = paths.karabiner_complex_mods_dir().parent.parent / "karabiner.json"
-    rule_active = False
-    if kb_config.exists():
-        try:
-            data = json.loads(kb_config.read_text())
-            for prof in data.get("profiles", []):
-                for r in prof.get("complex_modifications", {}).get("rules", []):
-                    if "Shout" in (r.get("description") or ""):
-                        rule_active = True
-                        break
-                if rule_active:
-                    break
-        except json.JSONDecodeError:
-            pass
+    # The LaunchAgent re-applies the remap at every login.
+    agent_path = paths.capslock_remap_agent_path()
     check(
-        "Karabiner rule enabled in active profile",
-        rule_active,
-        str(kb_config) if kb_config.exists() else "(karabiner.json missing)",
+        "capslock-remap LaunchAgent installed",
+        agent_path.exists(),
+        str(agent_path),
     )
-
-    hs_lua = paths.hammerspoon_config_dir() / "shout.lua"
-    check("Hammerspoon shout.lua installed", hs_lua.exists(), str(hs_lua))
-
-    init_lua = paths.hammerspoon_config_dir() / "init.lua"
-    init_ok = init_lua.exists() and 'require("shout")' in init_lua.read_text()
-    check("Hammerspoon init.lua requires shout", init_ok, str(init_lua))
 
     socket_alive = False
     try:
@@ -234,85 +207,6 @@ def _doctor() -> int:
     return 0
 
 
-def _enable_karabiner_rule(config_path: Path, rule_file: Path) -> str | None:
-    """Inject our rule into the active Karabiner profile.
-
-    Returns a one-line summary of what changed, or None if the rule was
-    already enabled.
-
-    The rule library file under ~/.config/karabiner/assets/complex_modifications
-    is just an *available* rule — Karabiner doesn't apply rules from
-    there unless they are also present in the active profile's
-    `complex_modifications.rules` list (which is what the UI's
-    "Add rule" button does behind the scenes).
-
-    If `karabiner.json` does not yet exist (the user hasn't opened
-    Karabiner-Elements Settings to create it), we write a minimal
-    default config with our rule pre-enabled. If it does exist, we
-    patch the selected profile in place, deduplicating by rule
-    description.
-    """
-    rule_doc = json.loads(rule_file.read_text())
-    new_rules = rule_doc.get("rules", [])
-    if not new_rules:
-        return None
-
-    if config_path.exists():
-        config = json.loads(config_path.read_text())
-        action = "patched"
-    else:
-        config = _karabiner_default_config()
-        action = "created"
-
-    profiles = config.setdefault("profiles", [])
-    if not profiles:
-        profiles.append(_karabiner_default_profile())
-
-    target = next((p for p in profiles if p.get("selected")), profiles[0])
-    cm = target.setdefault("complex_modifications", {"rules": []})
-    cm.setdefault("rules", [])
-
-    existing_descs = {r.get("description") for r in cm["rules"]}
-    added = []
-    for r in new_rules:
-        if r.get("description") in existing_descs:
-            continue
-        cm["rules"].append(copy.deepcopy(r))
-        added.append(r.get("description", "(no description)"))
-
-    if not added and action == "patched":
-        return None
-
-    config_path.parent.mkdir(parents=True, exist_ok=True)
-    config_path.write_text(json.dumps(config, indent=4) + "\n")
-    if added:
-        return f"{action} {config_path} (enabled: {', '.join(added)})"
-    return f"{action} {config_path}"
-
-
-def _karabiner_default_profile() -> dict:
-    return {
-        "name": "Default profile",
-        "selected": True,
-        "complex_modifications": {"rules": []},
-        "simple_modifications": [],
-        "fn_function_keys": [],
-        "devices": [],
-        "virtual_hid_keyboard": {"country_code": 0},
-    }
-
-
-def _karabiner_default_config() -> dict:
-    return {
-        "profiles": [_karabiner_default_profile()],
-        "global": {
-            "check_for_updates_on_startup": True,
-            "show_in_menu_bar": True,
-            "show_profile_name_in_menu_bar": False,
-        },
-    }
-
-
 def _bench() -> int:
     repo_root = _repo_root()
     bench = repo_root / "scripts" / "bench-cold-start.py"
@@ -327,6 +221,31 @@ def _bench() -> int:
 
 
 # ----------------- helpers -----------------
+
+
+def _hidutil_caps_to_f19_active() -> tuple[bool, str]:
+    """Inspect the current hidutil UserKeyMapping for our caps→F19 entry.
+
+    hidutil emits an NSDictionary description (not JSON), so we just
+    string-match the decimal forms of the page+code pair."""
+    try:
+        result = subprocess.run(
+            ["/usr/bin/hidutil", "property", "--get", "UserKeyMapping"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        return False, f"({e})"
+
+    out = result.stdout
+    src = str(_HID_CAPS_LOCK_DEC)
+    dst = str(_HID_F19_DEC)
+    if src in out and dst in out:
+        return True, "(via hidutil)"
+    if out.strip() in ("", "(null)"):
+        return False, "(no UserKeyMapping set)"
+    return False, "(UserKeyMapping has other entries but not caps→f19)"
 
 
 def _resource_path(*parts: str) -> str:

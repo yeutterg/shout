@@ -39,6 +39,7 @@ from queue import Empty, Queue
 from typing import Optional
 
 from . import inject, paths, protocol
+from .hotkey import HotkeyListener
 from .overlay import Overlay
 from .stream import DEFAULT_CONTEXT_SIZE, Streamer
 
@@ -65,7 +66,7 @@ log = logging.getLogger("shout.daemon")
 class _UIMsg:
     """Cross-thread message from worker → main(tk) thread."""
 
-    kind: str  # "show" | "hide" | "draft"
+    kind: str  # "show" | "hide" | "finalized" | "draft"
     text: str = ""
 
 
@@ -82,6 +83,7 @@ class Daemon:
 
         self._root: Optional[tk.Tk] = None
         self._overlay: Optional[Overlay] = None
+        self._hotkey: Optional[HotkeyListener] = None
 
     # ----------------- public entry point -----------------
 
@@ -101,6 +103,13 @@ class Daemon:
             target=self._worker_loop, name="shout-worker", daemon=True
         ).start()
 
+        # F19 listener replaces what Hammerspoon used to do. It posts
+        # raw start/stop strings onto the same cmd_q the socket thread
+        # uses, so the worker treats keyboard-driven and IPC-driven
+        # sessions identically.
+        self._hotkey = HotkeyListener(self._cmd_q)
+        self._hotkey.start()
+
         self._root.after(_UI_POLL_MS, self._drain_ui_queue)
         try:
             self._root.mainloop()
@@ -108,6 +117,8 @@ class Daemon:
             pass
         finally:
             self._shutdown.set()
+            if self._hotkey is not None:
+                self._hotkey.stop()
             try:
                 os.unlink(paths.SOCKET_PATH)
             except FileNotFoundError:
@@ -124,8 +135,10 @@ class Daemon:
                     self._overlay.show()
                 elif msg.kind == "hide":
                     self._overlay.hide()
+                elif msg.kind == "finalized":
+                    self._overlay.append_finalized(msg.text)
                 elif msg.kind == "draft":
-                    self._overlay.set_text(msg.text)
+                    self._overlay.set_draft(msg.text)
         except Empty:
             pass
         if not self._shutdown.is_set():
@@ -210,6 +223,9 @@ class Daemon:
                 if frame is not None:
                     if frame.finalized_delta:
                         inject.type_text(frame.finalized_delta)
+                        self._ui_q.put(
+                            _UIMsg(kind="finalized", text=frame.finalized_delta)
+                        )
                     self._ui_q.put(_UIMsg(kind="draft", text=frame.draft))
 
                 time.sleep(_TICK_INTERVAL_S)
@@ -220,6 +236,9 @@ class Daemon:
             final = streamer.stop()
             if final.finalized_delta:
                 inject.type_text(final.finalized_delta)
+                self._ui_q.put(
+                    _UIMsg(kind="finalized", text=final.finalized_delta)
+                )
         except Exception:
             log.exception("session: error during stop")
 
