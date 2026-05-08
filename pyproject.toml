@@ -33,4 +33,6 @@ packages = ["src/shout"]
 [dependency-groups]
 dev = [
     "homebrew-pypi-poet>=0.10",
+    # poet still imports pkg_resources, removed in setuptools 81+
+    "setuptools<81",
 ]
