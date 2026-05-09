@@ -1,9 +1,17 @@
-"""Menu bar icon with a Microphone picker.
+"""Menu bar icon with a Microphone picker and a Quit item.
 
-Lives next to the clock. Click reveals a submenu listing every input
-device sounddevice sees on this Mac, plus a "System default" entry.
-Selecting a device writes ~/Library/Application Support/Shout/config.json
-and the next PTT session uses that device.
+Lives next to the clock. Click reveals:
+  Microphone (header)
+  System default (NAME)
+  ---
+  <list of input devices>
+  ---
+  Quit Shout
+
+Microphone selection writes to ~/Library/Application Support/Shout/
+config.json; the next PTT session reads it. Quit calls back into the
+daemon to shut it down (os._exit(0)), so brew services treats it as a
+clean exit and does NOT restart.
 
 Design choice: this is in the menu bar rather than on the overlay
 because the overlay is a non-activating NSPanel — it intentionally
@@ -19,6 +27,7 @@ The daemon's Daemon.run() does this once at startup.
 from __future__ import annotations
 
 import logging
+from typing import Callable, Optional
 
 import objc
 import sounddevice as sd
@@ -37,11 +46,11 @@ from . import config
 log = logging.getLogger("shout.menubar")
 
 
-class _MicMenuController(NSObject):
-    """ObjC delegate for the Microphone submenu actions."""
+class _MenuController(NSObject):
+    """ObjC delegate for menu actions (mic select + quit)."""
 
     def initWithMenuBar_(self, menubar):
-        self = objc.super(_MicMenuController, self).init()
+        self = objc.super(_MenuController, self).init()
         if self is None:
             return None
         self._menubar = menubar
@@ -57,14 +66,23 @@ class _MicMenuController(NSObject):
             log.info("input device → %s", name)
         self._menubar.rebuild()
 
-    # Force the bridge to expose this as the @selector(selectMic:) name.
+    def quitShout_(self, sender):
+        log.info("quit requested from menu bar")
+        cb = self._menubar.on_quit
+        if cb is not None:
+            cb()
+
+    # Expose under the @selector(selectMic:) / @selector(quitShout:) names.
     selectMic_ = objc.selector(selectMic_, signature=b"v@:@")
+    quitShout_ = objc.selector(quitShout_, signature=b"v@:@")
 
 
 class MenuBar:
     """Holds the NSStatusItem and refreshes its menu on demand."""
 
-    def __init__(self) -> None:
+    def __init__(self, on_quit: Optional[Callable[[], None]] = None) -> None:
+        self.on_quit = on_quit
+
         bar = NSStatusBar.systemStatusBar()
         self._item = bar.statusItemWithLength_(NSVariableStatusItemLength)
         # An emoji is the cheapest icon path for v0; an SF Symbol via
@@ -72,7 +90,7 @@ class MenuBar:
         self._item.button().setTitle_("●")
         self._item.button().setToolTip_("Shout")
 
-        self._controller = _MicMenuController.alloc().initWithMenuBar_(self)
+        self._controller = _MenuController.alloc().initWithMenuBar_(self)
         self.rebuild()
 
     def rebuild(self) -> None:
@@ -127,6 +145,14 @@ class MenuBar:
                 else NSControlStateValueOff
             )
             menu.addItem_(item)
+
+        menu.addItem_(NSMenuItem.separatorItem())
+
+        quit_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Quit Shout", "quitShout:", "q"
+        )
+        quit_item.setTarget_(self._controller)
+        menu.addItem_(quit_item)
 
         self._item.setMenu_(menu)
 

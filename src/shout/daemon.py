@@ -94,8 +94,10 @@ class Daemon:
 
         self._overlay = Overlay()
         # Menu bar lives in the same NSApplication run loop as the
-        # overlay; constructed on main thread.
-        self._menubar = MenuBar()
+        # overlay; constructed on main thread. Quit is wired straight
+        # to _shutdown_now so the user can kill the daemon from the menu
+        # without going through brew services.
+        self._menubar = MenuBar(on_quit=lambda: self._shutdown_now(0))
 
         threading.Thread(
             target=self._socket_loop, name="shout-socket", daemon=True

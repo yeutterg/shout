@@ -33,11 +33,15 @@ _CHANNELS = 1
 _BLOCKSIZE = 1_600  # 100 ms at 16 kHz
 
 # (left_context, right_context) in encoder frames (~80 ms each for
-# parakeet-tdt-0.6b-v3 with subsampling_factor=8). Right context = 8
-# means ~640 ms of forward audio is buffered before tokens finalize —
+# parakeet-tdt-0.6b-v3 with subsampling_factor=8). Right context = 16
+# means ~1.28 s of forward audio is buffered before tokens finalize —
 # a deliberate tradeoff between latency and stability. 0 (the PRD's
-# original ask) is rejected by parakeet-mlx ≥0.5.
-DEFAULT_CONTEXT_SIZE = (256, 8)
+# original ask) is rejected by parakeet-mlx ≥0.5; 8 was the v0 starting
+# point but produced visibly noisy finalization (the user reported
+# "transcription doesn't seem very accurate"); 16 is still inside the
+# 1.5 s acceptance budget while giving the model meaningfully more
+# future context.
+DEFAULT_CONTEXT_SIZE = (256, 16)
 
 
 @dataclass
