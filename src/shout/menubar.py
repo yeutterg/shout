@@ -85,9 +85,14 @@ class MenuBar:
         menu.addItem_(header)
 
         current = config.get_input_device()
+        default_name = _default_input_name()
+        default_title = (
+            f"System default ({default_name})"
+            if default_name else "System default"
+        )
 
         default_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-            "System default", "selectMic:", ""
+            default_title, "selectMic:", ""
         )
         default_item.setTarget_(self._controller)
         default_item.setRepresentedObject_("__default__")
@@ -124,3 +129,18 @@ class MenuBar:
             menu.addItem_(item)
 
         self._item.setMenu_(menu)
+
+
+def _default_input_name() -> str | None:
+    """Resolve sounddevice's current default input device to a human name.
+
+    Falls back to None on failure so the menu still renders (with a
+    plain 'System default' label) if the host audio API is unhappy."""
+    try:
+        info = sd.query_devices(kind="input")
+    except Exception:
+        return None
+    if isinstance(info, dict):
+        name = info.get("name")
+        return name if isinstance(name, str) and name else None
+    return None
