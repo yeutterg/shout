@@ -175,22 +175,39 @@ def _doctor() -> int:
         ui_detail = f"({e})"
     check("AppKit importable", ui_ok, ui_detail)
 
-    # Microphone permission. Without this, every sample sounddevice
-    # produces is zero — see permissions.py.
-    from . import permissions as _perms
-    mic = _perms.microphone_status()
-    check(
-        "Microphone permission granted",
-        mic == "authorized",
-        f"({mic})",
-    )
+    # Microphone & event-tap permissions are reported by the daemon
+    # itself via ping. We can't probe them from `shout doctor`'s own
+    # process because TCC attributes grants per-responsible-process,
+    # and a CLI invocation has a different responsible process than the
+    # launchd-spawned daemon — even with the same binary path.
+    daemon_perms: dict | None = None
+    try:
+        resp = protocol.send_command(str(paths.SOCKET_PATH), protocol.CMD_PING)
+        if resp.get("ok"):
+            daemon_perms = resp
+    except Exception:
+        pass
 
-    # CGEventTap creation succeeds iff the process has effective event-
-    # tap rights — Apple gates this on either Accessibility or Input
-    # Monitoring (both work). This probe creates a temporary listen-only
-    # tap and releases it.
-    ax = _perms.accessibility_effective()
-    check("CGEventTap allowed (Accessibility or Input Monitoring)", ax)
+    if daemon_perms is not None:
+        mic = daemon_perms.get("microphone", "unknown")
+        check(
+            "Daemon has Microphone permission",
+            mic == "authorized",
+            f"({mic})",
+        )
+        ev = bool(daemon_perms.get("event_tap"))
+        check("Daemon has event-tap permission (Accessibility/Input Monitoring)", ev)
+    else:
+        check(
+            "Daemon has Microphone permission",
+            False,
+            "(daemon not reachable; start with `brew services start shout`)",
+        )
+        check(
+            "Daemon has event-tap permission",
+            False,
+            "(daemon not reachable)",
+        )
 
     # Caps Lock → F19 hidutil remap currently active?
     remap_active, remap_detail = _hidutil_caps_to_f19_active()

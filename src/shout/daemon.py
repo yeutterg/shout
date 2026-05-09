@@ -79,6 +79,8 @@ class Daemon:
         self._model_id = model_id or config.get_model() or DEFAULT_MODEL
 
         self._cmd_q: Queue[str] = Queue()
+        self._perm_microphone: str = "unknown"
+        self._perm_event_tap: bool = False
         self._model_ready = threading.Event()
         self._session_running = threading.Event()
         self._reload_requested = threading.Event()
@@ -99,13 +101,19 @@ class Daemon:
         self._setup_logging()
         log.info("daemon starting; model=%s", self._model_id)
 
-        # Surface microphone state at startup. The single most common
-        # reason transcripts come back empty is silent-zeros from a
-        # denied Microphone (sounddevice opens InputStream successfully
-        # but every sample is 0; see python-sounddevice#196). Mic check
-        # is read-only via AVCaptureDevice.
-        mic_status = permissions.microphone_status()
-        log.info("permissions: microphone=%s", mic_status)
+        # Probe and cache permission state from the daemon's own
+        # process context. Doctor reads this via ping so the user sees
+        # truth even though `shout doctor` is invoked from the user's
+        # shell (different responsible process → may have different
+        # TCC grants).
+        self._perm_microphone = permissions.microphone_status()
+        self._perm_event_tap = permissions.accessibility_effective()
+        log.info(
+            "permissions: microphone=%s event_tap=%s",
+            self._perm_microphone,
+            "yes" if self._perm_event_tap else "no",
+        )
+        mic_status = self._perm_microphone
         if mic_status not in ("authorized", "unknown"):
             log.error(
                 "Microphone permission is %r. Audio capture will return "
@@ -372,6 +380,8 @@ class Daemon:
                         "model_ready": self._model_ready.is_set(),
                         "session_running": self._session_running.is_set(),
                         "model": self._model_id,
+                        "microphone": self._perm_microphone,
+                        "event_tap": self._perm_event_tap,
                     }
                 )
             )
