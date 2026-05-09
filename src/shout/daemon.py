@@ -49,7 +49,14 @@ from .menubar import MenuBar
 from .overlay import Overlay
 from .stream import DEFAULT_CONTEXT_SIZE, Streamer
 
-DEFAULT_MODEL = "mlx-community/parakeet-tdt-0.6b-v3"
+# English-only Parakeet. We previously defaulted to v3 (multilingual,
+# auto-detect across ~25 European languages), but the user reported
+# "the transcription is way off, it did another language!!" — short or
+# noisy English clips can trip v3's language auto-detect into Spanish,
+# French, etc. v2 has no auto-detect, same size and architecture.
+# Override via ~/Library/Application Support/Shout/config.json:
+#   {"model": "mlx-community/parakeet-tdt-0.6b-v3"}  # to opt back into multilingual
+DEFAULT_MODEL = "mlx-community/parakeet-tdt-0.6b-v2"
 
 # How often the worker polls the streamer. ~33 Hz is fast enough for
 # tokens to feel live without burning a core.
@@ -66,8 +73,9 @@ log = logging.getLogger("shout.daemon")
 
 
 class Daemon:
-    def __init__(self, model_id: str = DEFAULT_MODEL) -> None:
-        self._model_id = model_id
+    def __init__(self, model_id: str | None = None) -> None:
+        # Resolution order: explicit constructor arg > config.json > default.
+        self._model_id = model_id or config.get_model() or DEFAULT_MODEL
 
         self._cmd_q: Queue[str] = Queue()
         self._model_ready = threading.Event()

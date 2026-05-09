@@ -52,3 +52,14 @@ def set_input_device(name: str | None) -> None:
     else:
         data["input_device"] = name
     save(data)
+
+
+def get_model() -> str | None:
+    """Override the default Parakeet model via config.json {"model": "..."}.
+
+    Common values:
+      - mlx-community/parakeet-tdt-0.6b-v2 — English-only (default)
+      - mlx-community/parakeet-tdt-0.6b-v3 — 25 European languages, auto-detect
+    """
+    val = load().get("model")
+    return val if isinstance(val, str) and val else None
