@@ -101,10 +101,21 @@ class Streamer:
         self._streamer = self._stream_ctx.__enter__()
         self._finalized_emitted_count = 0
 
+        # Counters touched only from the PortAudio callback thread, read
+        # from the worker thread for the diagnostic log line in stop().
+        self._cb_invocations = 0
+        self._cb_total_samples = 0
+
         def _audio_callback(indata, frames, time_info, status):
             # PortAudio thread — keep it cheap. Just push into the queue.
+            self._cb_invocations += 1
+            self._cb_total_samples += frames
             self._audio_q.put(indata[:, 0].copy())
 
+        log.info(
+            "opening InputStream: device=%r samplerate=%d blocksize=%d",
+            self._input_device, _SAMPLE_RATE, _BLOCKSIZE,
+        )
         self._sd_stream = sd.InputStream(
             samplerate=_SAMPLE_RATE,
             channels=_CHANNELS,
@@ -149,6 +160,12 @@ class Streamer:
             self._sd_stream.stop()
             self._sd_stream.close()
             self._sd_stream = None
+        log.info(
+            "audio capture: %d callback invocations, %d samples (%.2f s)",
+            getattr(self, "_cb_invocations", 0),
+            getattr(self, "_cb_total_samples", 0),
+            getattr(self, "_cb_total_samples", 0) / _SAMPLE_RATE,
+        )
 
         # Drain any final chunks (also updates the live overlay one
         # last time before we tear down).

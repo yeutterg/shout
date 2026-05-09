@@ -35,7 +35,7 @@ from AppKit import (
     NSWindowStyleMaskBorderless,
     NSWindowStyleMaskNonactivatingPanel,
 )
-from Foundation import NSMakeRect, NSMakeSize, NSOperationQueue
+from Foundation import NSMakePoint, NSMakeRect, NSOperationQueue
 
 
 _BG_R, _BG_G, _BG_B, _BG_A = 0.10, 0.10, 0.10, 0.92
@@ -60,8 +60,16 @@ log = logging.getLogger("shout.overlay")
 
 
 def _on_main(fn):
-    """Schedule fn() on the main thread; safe from any thread."""
-    NSOperationQueue.mainQueue().addOperationWithBlock_(fn)
+    """Schedule fn() on the main thread; safe from any thread.
+
+    Wraps fn() so any Python exception is logged rather than silently
+    swallowed by the AppKit/dispatch boundary."""
+    def safe():
+        try:
+            fn()
+        except Exception:
+            log.exception("overlay main-thread block raised")
+    NSOperationQueue.mainQueue().addOperationWithBlock_(safe)
 
 
 class Overlay:
@@ -215,7 +223,7 @@ class Overlay:
             stream_y = (_HEIGHT - history_size.height) / 2.0
 
         self._history_field.setFrameOrigin_(
-            NSMakeSize(_PADDING, stream_y)
+            NSMakePoint(_PADDING, stream_y)
         )
         self._draft_field.setFrameOrigin_(
             NSMakeSize(_PADDING + history_size.width, stream_y)
