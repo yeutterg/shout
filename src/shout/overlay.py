@@ -10,6 +10,14 @@ context window of parakeet-mlx, typically 1-3 words. With finalized
 history added, the user sees a sentence-or-so of context, which makes
 edits and intent visible without scrolling the cursor.
 
+Critical macOS detail: Tk Toplevels become the *key* window when shown
+(especially after `lift()`), which steals keyboard focus from whatever
+app the user was typing into. CGEvent text injection then lands in the
+overlay (a tk.Label, which silently drops keystrokes) instead of the
+target app. We fix this by switching the window to the macOS native
+"floating, non-activating" style — a class of NSPanel that floats
+above other windows without ever becoming key.
+
 Threading rule: all tkinter calls must come from the thread that owns
 the Tk root (the daemon's main thread). Workers schedule updates via
 the daemon's UI queue, drained by `Daemon._drain_ui_queue`.
@@ -17,20 +25,27 @@ the daemon's UI queue, drained by `Daemon._drain_ui_queue`.
 
 from __future__ import annotations
 
+import logging
 import tkinter as tk
 
 
 _BG = "#1a1a1a"
 _FG_FINAL = "#dddddd"
 _FG_DRAFT = "#9aa0a8"
-_FONT = ("Helvetica Neue", 18)
-_HEIGHT = 56
+# Half the prior font size so we can fit ~2x the words.
+_FONT = ("Helvetica Neue", 14)
+# Roughly 2x the prior min-height. Actual size tracks text via geometry.
+_MIN_HEIGHT = 112
 _BOTTOM_MARGIN = 80
+# Fixed overlay width, so growing text wraps within it instead of
+# stretching the strip across the screen.
+_WIDTH = 760
+# Roll the displayed history up to this many characters. With the
+# smaller font and wider strip, ~240 chars renders comfortably across
+# 2-3 wrapped lines.
+_HISTORY_CHARS = 240
 
-# Roll the displayed history up to this many characters. The strip
-# wraps to fit, so we cap text length rather than width to keep
-# rendering cost bounded.
-_HISTORY_CHARS = 120
+log = logging.getLogger("shout.overlay")
 
 
 class Overlay:
@@ -41,25 +56,59 @@ class Overlay:
         self._win = tk.Toplevel(root)
         self._win.withdraw()
         self._win.overrideredirect(True)
+        # Set the macOS NSPanel-style class to "floating" with the
+        # `nonActivatingPanel` attribute. This is the same trick
+        # Wispr Flow / Spotlight / Alfred use: the window floats above
+        # other apps without ever stealing focus, so CGEvent text
+        # injection continues to land in whatever app was previously
+        # focused.
+        try:
+            self._win.tk.call(
+                "::tk::unsupported::MacWindowStyle",
+                "style",
+                self._win._w,
+                "floating",
+                "nonActivating",
+            )
+        except tk.TclError:
+            log.warning(
+                "could not set MacWindowStyle (non-macOS or older Tk?); "
+                "overlay may steal keyboard focus"
+            )
         self._win.attributes("-topmost", True)
         self._win.attributes("-alpha", 0.92)
         self._win.configure(bg=_BG)
 
-        # Tk's Label only takes a single foreground; to render finalized
-        # text brighter than draft we use two adjacent Labels packed
-        # left-to-right inside a frame.
+        # Two adjacent labels: brighter for finalized history, dimmer
+        # for the draft tail. wraplength forces text to wrap at the
+        # overlay width rather than letting the strip grow horizontally.
         self._frame = tk.Frame(self._win, bg=_BG)
-        self._frame.pack(padx=18, pady=12)
+        self._frame.pack(padx=18, pady=12, fill=tk.BOTH, expand=True)
+        wrap = _WIDTH - 36  # account for padx
         self._final_label = tk.Label(
-            self._frame, text="", fg=_FG_FINAL, bg=_BG, font=_FONT
+            self._frame,
+            text="",
+            fg=_FG_FINAL,
+            bg=_BG,
+            font=_FONT,
+            wraplength=wrap,
+            justify=tk.LEFT,
+            anchor="w",
         )
-        self._final_label.pack(side=tk.LEFT)
+        self._final_label.pack(side=tk.LEFT, anchor="nw")
         self._draft_label = tk.Label(
-            self._frame, text="", fg=_FG_DRAFT, bg=_BG, font=_FONT
+            self._frame,
+            text="",
+            fg=_FG_DRAFT,
+            bg=_BG,
+            font=_FONT,
+            wraplength=wrap,
+            justify=tk.LEFT,
+            anchor="w",
         )
-        self._draft_label.pack(side=tk.LEFT)
+        self._draft_label.pack(side=tk.LEFT, anchor="nw")
 
-        self._history = ""  # tail of finalized text
+        self._history = ""
         self._draft = ""
 
     # ---- public API ----
@@ -67,7 +116,8 @@ class Overlay:
     def show(self) -> None:
         self._reposition()
         self._win.deiconify()
-        self._win.lift()
+        # NB: no lift() — that promotes the window to key/active and
+        # would defeat the nonActivating panel style on macOS.
 
     def hide(self) -> None:
         self._win.withdraw()
@@ -77,40 +127,28 @@ class Overlay:
         self._draft_label.configure(text="")
 
     def append_finalized(self, text: str) -> None:
-        """Append text that the daemon has just typed at the cursor."""
         self._history = (self._history + text)[-_HISTORY_CHARS:]
         self._render()
 
     def set_draft(self, draft: str) -> None:
-        """Replace the current draft (still-being-revised tail)."""
         self._draft = draft
         self._render()
 
     # ---- internals ----
 
     def _render(self) -> None:
-        # Strip a leading space if history is empty (Parakeet often
-        # emits a leading space at sentence start, which looks ugly
-        # pinned to the strip's left edge).
-        history = self._history if self._history else self._history
-        draft = self._draft
-        if not history:
-            history_render = ""
-            draft_render = draft.lstrip()
-        else:
-            history_render = history.lstrip()
-            draft_render = draft
-
-        self._final_label.configure(text=history_render)
-        self._draft_label.configure(text=draft_render)
+        history = self._history.lstrip() if self._history else ""
+        draft = self._draft if history else self._draft.lstrip()
+        self._final_label.configure(text=history)
+        self._draft_label.configure(text=draft)
         self._reposition()
 
     def _reposition(self) -> None:
         self._win.update_idletasks()
         screen_w = self._root.winfo_screenwidth()
         screen_h = self._root.winfo_screenheight()
-        win_w = max(self._win.winfo_reqwidth(), 200)
-        win_h = max(self._win.winfo_reqheight(), _HEIGHT)
+        win_w = _WIDTH
+        win_h = max(self._win.winfo_reqheight(), _MIN_HEIGHT)
         x = (screen_w - win_w) // 2
         y = screen_h - win_h - _BOTTOM_MARGIN
         self._win.geometry(f"{win_w}x{win_h}+{x}+{y}")

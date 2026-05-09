@@ -13,7 +13,11 @@ Accessibility → add the Python interpreter or the daemon binary.
 
 from __future__ import annotations
 
+import logging
+
 import Quartz
+
+log = logging.getLogger("shout.inject")
 
 
 # CGEventKeyboardSetUnicodeString accepts up to 20 UTF-16 code units per
@@ -34,6 +38,7 @@ def type_text(text: str) -> None:
     if not text:
         return
 
+    log.debug("type_text(%r)", text)
     for chunk in _utf16_safe_chunks(text, _MAX_UTF16_UNITS):
         # virtualKey=0 is fine: Set...UnicodeString overrides the keycode
         # interpretation. We post a single keyDown — a separate keyUp

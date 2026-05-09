@@ -325,8 +325,12 @@ class Daemon:
         root_log = logging.getLogger()
         if root_log.handlers:
             return
+        # Pick up SHOUT_LOG_LEVEL=DEBUG from the environment for noisy
+        # diagnostics; default INFO is fine for steady-state.
+        level_name = os.environ.get("SHOUT_LOG_LEVEL", "INFO").upper()
+        level = getattr(logging, level_name, logging.INFO)
         logging.basicConfig(
-            level=logging.INFO,
+            level=level,
             format="%(asctime)s %(levelname)s %(name)s: %(message)s",
             handlers=[
                 logging.FileHandler(log_path),
