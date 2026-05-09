@@ -43,6 +43,11 @@ _BLOCKSIZE = 1_600  # 100 ms at 16 kHz
 # future context.
 DEFAULT_CONTEXT_SIZE = (256, 16)
 
+# Silence-pad duration on stop(). Must exceed
+# context_size[1] * frame_seconds to drive the right-context window
+# past everything spoken so all tokens finalize.
+_SILENCE_PAD_SECONDS = 1.5
+
 
 @dataclass
 class Frame:
@@ -126,10 +131,25 @@ class Streamer:
         return self._build_frame()
 
     def stop(self) -> Frame:
-        """Close audio, drain any last chunks, return the final frame.
+        """Close audio, drain any last chunks, force final finalization,
+        return the resulting frame.
 
         After stop() the Streamer cannot be reused — make a new one
-        for the next session."""
+        for the next session.
+
+        We pad the audio buffer with silence before reading the final
+        result. The streaming model holds back ~context_size[1] frames
+        of right-context before committing tokens; when the user
+        releases Caps Lock, the last ~1.3s of speech is still in
+        `draft` and would be wrong if we just typed it. Pushing 1.5s
+        of silence into add_audio() slides the right-context window
+        past the actual speech, so the model finalizes those tokens
+        properly. We then take the new finalized delta and discard
+        any draft (which would only contain silence-driven artifacts).
+        Empirically this turns "I want to write us" (mistranscription
+        because the trailing tokens never had full right-context) into
+        "I want to write a sentence" or whatever the user actually said.
+        """
         if self._sd_stream is not None:
             self._sd_stream.stop()
             self._sd_stream.close()
@@ -138,10 +158,14 @@ class Streamer:
         # Drain whatever audio arrived between the last tick() and now.
         leftover_frame = self.tick() or Frame(finalized_delta="", draft="")
 
-        # On end-of-session, treat any remaining draft text as final —
-        # the user has stopped speaking, so there are no more revisions
-        # coming. This is the v0 "final flush" behavior.
-        draft = self._render_draft()
+        # Silence-pad to force finalization of in-flight tokens.
+        # 1.5s comfortably exceeds our right-context (16 frames * 80ms = 1.28s).
+        if self._streamer is not None:
+            pad_samples = int(_SILENCE_PAD_SECONDS * _SAMPLE_RATE)
+            self._streamer.add_audio(mx.zeros(pad_samples, dtype=mx.float32))
+            silence_frame = self._build_frame()
+        else:
+            silence_frame = Frame(finalized_delta="", draft="")
 
         # Close the streaming context (frees MLX caches).
         if self._stream_ctx is not None:
@@ -150,7 +174,8 @@ class Streamer:
             self._streamer = None
 
         return Frame(
-            finalized_delta=leftover_frame.finalized_delta + draft,
+            finalized_delta=leftover_frame.finalized_delta
+            + silence_frame.finalized_delta,
             draft="",
         )
 

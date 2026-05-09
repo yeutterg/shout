@@ -1,24 +1,28 @@
-"""Menu bar icon with a Microphone picker and a Quit item.
+"""Menu bar icon: microphone + model + language pickers + quit.
 
 Lives next to the clock. Click reveals:
-  Microphone (header)
-  System default (NAME)
-  ---
-  <list of input devices>
-  ---
-  Quit Shout
+  Microphone
+    System default (NAME)
+    <list of input devices>
+  Model
+    <known Parakeet variants, ✓ on the active one>
+  Language
+    English
+    Multilingual (auto-detect)            ← grayed when current model is English-only
+  ─────
+  Quit Shout                               ⌘Q
 
 Microphone selection writes to ~/Library/Application Support/Shout/
-config.json; the next PTT session reads it. Quit calls back into the
-daemon to shut it down (os._exit(0)), so brew services treats it as a
-clean exit and does NOT restart.
+config.json; the next PTT session reads it.
 
-Design choice: this is in the menu bar rather than on the overlay
-because the overlay is a non-activating NSPanel — it intentionally
-cannot accept keyboard focus (so CGEvent typing passes through to the
-user's app), and it is only visible during a session. A menu bar item
-is the standard macOS pattern for an always-reachable settings affordance,
-and it's the same approach Wispr Flow takes.
+Model and Language selections also write to config.json, then trigger
+a daemon restart (exit code 1, so brew services relaunches us). We
+have to restart because the model is loaded once at startup and held
+in MLX memory; hot-swapping is doable but not worth the complexity for
+a v0 feature that fires maybe once per power-user-onboarding session.
+
+Quit calls back into the daemon to shut it down (exit 0 = clean), so
+brew services treats it as a clean exit and does NOT auto-restart.
 
 Threading: must be created on the main thread (AppKit run loop owner).
 The daemon's Daemon.run() does this once at startup.
@@ -46,8 +50,29 @@ from . import config
 log = logging.getLogger("shout.menubar")
 
 
+# Known Parakeet variants the menu can switch between. (id, display, is_multilingual)
+# Add more entries here as new models become wrappable by parakeet-mlx.
+KNOWN_MODELS: list[tuple[str, str, bool]] = [
+    (
+        "mlx-community/parakeet-tdt-0.6b-v2",
+        "Parakeet TDT 0.6B v2 (English)",
+        False,
+    ),
+    (
+        "mlx-community/parakeet-tdt-0.6b-v3",
+        "Parakeet TDT 0.6B v3 (Multilingual)",
+        True,
+    ),
+]
+
+# The default the daemon falls back to when config.get_model() returns None.
+# Must agree with daemon.DEFAULT_MODEL.
+_DEFAULT_MODEL = "mlx-community/parakeet-tdt-0.6b-v2"
+
+
 class _MenuController(NSObject):
-    """ObjC delegate for menu actions (mic select + quit)."""
+    """ObjC delegate for menu actions (mic select + model select +
+    language select + quit)."""
 
     def initWithMenuBar_(self, menubar):
         self = objc.super(_MenuController, self).init()
@@ -66,41 +91,82 @@ class _MenuController(NSObject):
             log.info("input device → %s", name)
         self._menubar.rebuild()
 
+    def selectModel_(self, sender):
+        model_id = sender.representedObject()
+        config.set_model(model_id)
+        log.info("model → %s (will restart daemon)", model_id)
+        self._menubar.rebuild()
+        self._menubar.request_restart()
+
+    def selectLanguage_(self, sender):
+        # Language menu maps to a model: "english" → first English-only
+        # known model; "multilingual" → first multilingual known model.
+        kind = sender.representedObject()
+        target = next(
+            (m for m in KNOWN_MODELS if m[2] == (kind == "multilingual")),
+            None,
+        )
+        if target is None:
+            log.warning("no known model for language=%s", kind)
+            return
+        config.set_model(target[0])
+        log.info("language → %s (model %s, restarting)", kind, target[0])
+        self._menubar.rebuild()
+        self._menubar.request_restart()
+
     def quitShout_(self, sender):
         log.info("quit requested from menu bar")
         cb = self._menubar.on_quit
         if cb is not None:
             cb()
 
-    # Expose under the @selector(selectMic:) / @selector(quitShout:) names.
     selectMic_ = objc.selector(selectMic_, signature=b"v@:@")
+    selectModel_ = objc.selector(selectModel_, signature=b"v@:@")
+    selectLanguage_ = objc.selector(selectLanguage_, signature=b"v@:@")
     quitShout_ = objc.selector(quitShout_, signature=b"v@:@")
 
 
 class MenuBar:
     """Holds the NSStatusItem and refreshes its menu on demand."""
 
-    def __init__(self, on_quit: Optional[Callable[[], None]] = None) -> None:
+    def __init__(
+        self,
+        on_quit: Optional[Callable[[], None]] = None,
+        on_restart: Optional[Callable[[], None]] = None,
+    ) -> None:
         self.on_quit = on_quit
+        self.on_restart = on_restart
 
         bar = NSStatusBar.systemStatusBar()
         self._item = bar.statusItemWithLength_(NSVariableStatusItemLength)
-        # An emoji is the cheapest icon path for v0; an SF Symbol via
-        # NSImage.imageWithSystemSymbolName is a v1 polish swap.
         self._item.button().setTitle_("●")
         self._item.button().setToolTip_("Shout")
 
         self._controller = _MenuController.alloc().initWithMenuBar_(self)
         self.rebuild()
 
+    def request_restart(self) -> None:
+        if self.on_restart is not None:
+            self.on_restart()
+
     def rebuild(self) -> None:
         menu = NSMenu.alloc().init()
+        self._build_microphone_menu(menu)
+        self._build_model_menu(menu)
+        self._build_language_menu(menu)
+        menu.addItem_(NSMenuItem.separatorItem())
+        self._build_quit_item(menu)
+        self._item.setMenu_(menu)
 
-        header = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+    # ---- submenu builders ----
+
+    def _build_microphone_menu(self, menu) -> None:
+        mic_root = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
             "Microphone", None, ""
         )
-        header.setEnabled_(False)
-        menu.addItem_(header)
+        sub = NSMenu.alloc().init()
+        mic_root.setSubmenu_(sub)
+        menu.addItem_(mic_root)
 
         current = config.get_input_device()
         default_name = _default_input_name()
@@ -117,7 +183,7 @@ class MenuBar:
         default_item.setState_(
             NSControlStateValueOn if current is None else NSControlStateValueOff
         )
-        menu.addItem_(default_item)
+        sub.addItem_(default_item)
 
         try:
             devices = sd.query_devices()
@@ -142,17 +208,78 @@ class MenuBar:
                 NSControlStateValueOn if current == name
                 else NSControlStateValueOff
             )
-            menu.addItem_(item)
+            sub.addItem_(item)
 
-        menu.addItem_(NSMenuItem.separatorItem())
+    def _build_model_menu(self, menu) -> None:
+        root = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Model", None, ""
+        )
+        sub = NSMenu.alloc().init()
+        root.setSubmenu_(sub)
+        menu.addItem_(root)
 
+        current = config.get_model() or _DEFAULT_MODEL
+        for model_id, display, _ in KNOWN_MODELS:
+            item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                display, "selectModel:", ""
+            )
+            item.setTarget_(self._controller)
+            item.setRepresentedObject_(model_id)
+            item.setState_(
+                NSControlStateValueOn if model_id == current
+                else NSControlStateValueOff
+            )
+            sub.addItem_(item)
+
+    def _build_language_menu(self, menu) -> None:
+        root = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Language", None, ""
+        )
+        sub = NSMenu.alloc().init()
+        root.setSubmenu_(sub)
+        menu.addItem_(root)
+
+        current_id = config.get_model() or _DEFAULT_MODEL
+        current_is_multi = next(
+            (m[2] for m in KNOWN_MODELS if m[0] == current_id), False
+        )
+        any_multi_available = any(m[2] for m in KNOWN_MODELS)
+
+        en = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "English", "selectLanguage:", ""
+        )
+        en.setTarget_(self._controller)
+        en.setRepresentedObject_("english")
+        en.setState_(
+            NSControlStateValueOn if not current_is_multi
+            else NSControlStateValueOff
+        )
+        sub.addItem_(en)
+
+        # Per user request: gray out Multilingual when the *current*
+        # selected model is single-language. Switching to multilingual
+        # is then a two-step flow: pick a multilingual model first,
+        # then re-open this menu.
+        multi = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Multilingual (auto-detect)", "selectLanguage:", ""
+        )
+        multi.setTarget_(self._controller)
+        multi.setRepresentedObject_("multilingual")
+        multi.setState_(
+            NSControlStateValueOn if current_is_multi
+            else NSControlStateValueOff
+        )
+        # Disable when current model is single-language, OR when no
+        # multilingual model is in our known list at all.
+        multi.setEnabled_(any_multi_available and current_is_multi)
+        sub.addItem_(multi)
+
+    def _build_quit_item(self, menu) -> None:
         quit_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
             "Quit Shout", "quitShout:", "q"
         )
         quit_item.setTarget_(self._controller)
         menu.addItem_(quit_item)
-
-        self._item.setMenu_(menu)
 
 
 def _default_input_name() -> str | None:

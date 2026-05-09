@@ -63,3 +63,12 @@ def get_model() -> str | None:
     """
     val = load().get("model")
     return val if isinstance(val, str) and val else None
+
+
+def set_model(model_id: str | None) -> None:
+    data = load()
+    if model_id is None:
+        data.pop("model", None)
+    else:
+        data["model"] = model_id
+    save(data)
