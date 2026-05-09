@@ -269,9 +269,14 @@ class MenuBar:
             NSControlStateValueOn if current_is_multi
             else NSControlStateValueOff
         )
-        # Disable when current model is single-language, OR when no
-        # multilingual model is in our known list at all.
-        multi.setEnabled_(any_multi_available and current_is_multi)
+        # Enable iff we have any multilingual model available. Per the
+        # docstring at the top of this module, the visual ✓ tracks the
+        # current selection; clicking switches the model. Earlier code
+        # had `any_multi_available AND current_is_multi`, which had the
+        # bug that Multilingual was permanently grayed when the active
+        # model was English-only — defeating the whole point of the
+        # menu entry.
+        multi.setEnabled_(any_multi_available)
         sub.addItem_(multi)
 
     def _build_quit_item(self, menu) -> None:

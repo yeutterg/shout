@@ -37,11 +37,13 @@ class Shout < Formula
 
     # Runtime deps. Versions match pyproject.toml.
     system pip, "install",
-           "parakeet-mlx>=0.3",
+           "parakeet-mlx>=0.5",
            "sounddevice>=0.5",
+           "soundfile>=0.13",
            "numpy>=2.0",
            "pyobjc-framework-Quartz>=10.3",
-           "pyobjc-framework-Cocoa>=10.3"
+           "pyobjc-framework-Cocoa>=10.3",
+           "pyobjc-framework-AVFoundation>=10.3"
 
     # Install Shout itself last so its console_scripts entrypoint
     # ('shout = shout.cli:main') is registered against this venv.

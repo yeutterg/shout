@@ -226,10 +226,10 @@ class Overlay:
             NSMakePoint(_PADDING, stream_y)
         )
         self._draft_field.setFrameOrigin_(
-            NSMakeSize(_PADDING + history_size.width, stream_y)
+            NSMakePoint(_PADDING + history_size.width, stream_y)
         )
         self._batch_field.setFrameOrigin_(
-            NSMakeSize(_PADDING, batch_y)
+            NSMakePoint(_PADDING, batch_y)
         )
 
 

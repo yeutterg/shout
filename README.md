@@ -85,7 +85,7 @@ shout bench     # run the cold-start benchmark (development only)
 
 **Why no Hammerspoon either.** Original design used Hammerspoon to bind F19 hold/release and to detect triple-tap for the real-CapsLock fallback. The Shout daemon already needs Accessibility permission for Quartz CGEvent typing — that same permission lets us tap F19 directly via `Quartz.CGEventTapCreate`. One process, one permission grant, no Lua, no `init.lua` append.
 
-**Why `(256, 8)` for `context_size`, not `(256, 0)`.** The original PRD asked for zero right-context (lowest possible latency). `parakeet-mlx ≥ 0.5` rejects a zero right-context. With 8 encoder frames (~640 ms) of right context the streamer still finalizes well inside the 1.5 s budget while leaving enough lookahead to keep finalization stable.
+**Streaming preview during hold; batch on release types.** The streaming model has to commit each token with only ~1.3s of right-context (`context_size=(256, 16)`); when the user releases Caps Lock, anything still in `draft` would have been guessed without full context. Instead of typing those guesses, the daemon runs a full-context batch `model.transcribe()` over the captured audio buffer once and types the result. The streaming pass only drives the live overlay preview.
 
 **Why MLX threading runs the model on a worker thread.** MLX has per-thread default-stream state. The model has to live on the same thread that calls `add_audio`. Audio capture stays on PortAudio's internal thread (just `numpy.copy()` into a queue), and the worker thread does the inference; the main thread is reserved for the Tk event loop and the overlay window.
 
@@ -102,11 +102,14 @@ shout/
 ├── scripts/bench-cold-start.py   Latency benchmark
 ├── src/shout/
 │   ├── cli.py                    `shout` argv dispatch + setup/doctor
-│   ├── daemon.py                 Long-running daemon (Tk + worker + socket + hotkey threads)
+│   ├── daemon.py                 Long-running daemon (NSApp + worker + socket + hotkey threads)
 │   ├── hotkey.py                 Quartz CGEventTap for F19 + triple-tap → real Caps Lock
-│   ├── stream.py                 parakeet-mlx + sounddevice loop
+│   ├── stream.py                 parakeet-mlx + sounddevice + batch_transcribe
 │   ├── inject.py                 Quartz CGEvent unicode keystrokes
-│   ├── overlay.py                Tkinter floating overlay (rolling history + draft)
+│   ├── overlay.py                AppKit NSPanel (non-activating) — streaming preview + batch result
+│   ├── menubar.py                NSStatusItem with Microphone / Model / Language / Quit
+│   ├── permissions.py            AVCaptureDevice + AXIsProcessTrusted probes
+│   ├── config.py                 ~/Library/Application Support/Shout/config.json read/write
 │   ├── protocol.py               Tiny line-JSON protocol over Unix socket
 │   └── paths.py                  Filesystem locations
 └── launchd/
@@ -118,7 +121,7 @@ shout/
 
 ```bash
 git clone https://github.com/yeutterg/shout && cd shout
-brew install python-tk@3.12 uv
+brew install uv
 uv sync --group dev
 
 # Run the daemon in the foreground:

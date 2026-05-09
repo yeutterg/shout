@@ -35,6 +35,7 @@ from __future__ import annotations
 import logging
 import os
 import socket
+import sys
 import threading
 import time
 from queue import Empty, Queue
@@ -43,7 +44,7 @@ from typing import Optional
 from AppKit import NSApp, NSApplication, NSApplicationActivationPolicyAccessory
 from Foundation import NSOperationQueue
 
-from . import config, inject, paths, protocol
+from . import config, inject, paths, permissions, protocol
 from .hotkey import HotkeyListener
 from .menubar import MenuBar
 from .overlay import Overlay
@@ -97,6 +98,33 @@ class Daemon:
         paths.ensure_app_support()
         self._setup_logging()
         log.info("daemon starting; model=%s", self._model_id)
+
+        # Surface permission state at startup so the user does not waste
+        # time wondering why every transcript comes back empty (silent-
+        # zeros from a denied Microphone) or why F19 has no effect (no
+        # Accessibility for the event tap). Both checks are read-only.
+        mic_status = permissions.microphone_status()
+        ax_status = permissions.accessibility_trusted()
+        log.info(
+            "permissions: microphone=%s accessibility=%s",
+            mic_status, "yes" if ax_status else "no",
+        )
+        if mic_status not in ("authorized", "unknown"):
+            log.error(
+                "Microphone permission is %r. Audio capture will return "
+                "zeros and every transcript will be empty. Grant it in "
+                "System Settings → Privacy & Security → Microphone for "
+                "%s, then `brew services restart shout`.",
+                mic_status, sys.executable,
+            )
+        if not ax_status:
+            log.error(
+                "Accessibility permission is missing. The F19 event tap "
+                "will not arm and CGEvent text injection will silently "
+                "fail. Add the daemon binary to System Settings → Privacy "
+                "& Security → Accessibility:\n  %s",
+                sys.executable,
+            )
 
         # NSApplication has to be initialised on the main thread before
         # any AppKit object exists. Setting policy to Accessory keeps us
@@ -280,14 +308,15 @@ class Daemon:
             inject.type_text(batch_text)
         log.info("session: stop (batch=%r)", batch_text)
 
-        # Auto-hide the overlay 2 s later. The user has the typed text
-        # in their app at this point; the overlay just shows them what
-        # actually got typed.
+        # Clear `_session_running` BEFORE arming the auto-hide timer.
+        # If we cleared after, a fast re-press could land in the gap
+        # between session N's end and timer-arm and get rejected with
+        # "session already running".
+        self._session_running.clear()
+
         self._auto_hide_timer = threading.Timer(2.0, self._overlay.hide)
         self._auto_hide_timer.daemon = True
         self._auto_hide_timer.start()
-
-        self._session_running.clear()
 
     # ----------------- socket thread -----------------
 

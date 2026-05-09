@@ -9,11 +9,16 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
-    "parakeet-mlx>=0.3",
+    # 0.5+ exposes StreamingParakeet with the (left, right) context-size
+    # validation we depend on (right == 0 raises). Older versions silently
+    # accepted (256, 0) and we briefly defaulted to that during scaffolding.
+    "parakeet-mlx>=0.5",
     "sounddevice>=0.5",
+    "soundfile>=0.13",
     "numpy>=2.0",
     "pyobjc-framework-Quartz>=10.3",
     "pyobjc-framework-Cocoa>=10.3",
+    "pyobjc-framework-AVFoundation>=10.3",
 ]
 
 [project.scripts]

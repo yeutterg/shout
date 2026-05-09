@@ -175,6 +175,21 @@ def _doctor() -> int:
         ui_detail = f"({e})"
     check("AppKit importable", ui_ok, ui_detail)
 
+    # Microphone permission. Without this, every sample sounddevice
+    # produces is zero — see permissions.py.
+    from . import permissions as _perms
+    mic = _perms.microphone_status()
+    check(
+        "Microphone permission granted",
+        mic == "authorized",
+        f"({mic})",
+    )
+
+    # Accessibility powers both the F19 event tap and CGEvent text
+    # injection.
+    ax = _perms.accessibility_trusted()
+    check("Accessibility permission granted", ax)
+
     # Caps Lock → F19 hidutil remap currently active?
     remap_active, remap_detail = _hidutil_caps_to_f19_active()
     check("hidutil caps_lock → f19 active", remap_active, remap_detail)
