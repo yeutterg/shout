@@ -119,8 +119,6 @@ class MenuBar:
         )
         menu.addItem_(default_item)
 
-        menu.addItem_(NSMenuItem.separatorItem())
-
         try:
             devices = sd.query_devices()
         except Exception:
