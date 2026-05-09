@@ -64,15 +64,33 @@ def request_microphone_async() -> None:
     )
 
 
-def accessibility_trusted() -> bool:
-    """True iff the current process is trusted to post + tap CGEvents.
-    Same call AppKit/Quartz docs recommend for accessibility apps."""
+def accessibility_effective() -> bool:
+    """Whether CGEventTap creation actually succeeds.
+
+    AXIsProcessTrustedWithOptions(NULL) is the documented "is this
+    process in the Accessibility list" check, but in pyobjc on macOS
+    14+ it returns False for ad-hoc-signed Pythons even when CGEvent
+    APIs work fine (the user may have granted Input Monitoring instead
+    of Accessibility, or both, and AX checks one but not the other).
+    The reliable signal is whether `CGEventTapCreate` returns a non-
+    NULL CFMachPort. We probe with a listen-only tap that we tear down
+    immediately, so there is no lasting side-effect.
+    """
+    import Quartz
+
+    mask = (1 << Quartz.kCGEventKeyDown) | (1 << Quartz.kCGEventKeyUp)
     try:
-        # HIServices, exposed on the ApplicationServices bundle.
-        from ApplicationServices import AXIsProcessTrustedWithOptions
-    except ImportError:
-        return False
-    try:
-        return bool(AXIsProcessTrustedWithOptions(None))
+        tap = Quartz.CGEventTapCreate(
+            Quartz.kCGSessionEventTap,
+            Quartz.kCGHeadInsertEventTap,
+            1,  # kCGEventTapOptionListenOnly — no event modification
+            mask,
+            lambda proxy, t, ev, ctx: ev,
+            None,
+        )
     except Exception:
         return False
+    if not tap:
+        return False
+    Quartz.CFRelease(tap)
+    return True

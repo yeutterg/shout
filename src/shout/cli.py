@@ -185,10 +185,12 @@ def _doctor() -> int:
         f"({mic})",
     )
 
-    # Accessibility powers both the F19 event tap and CGEvent text
-    # injection.
-    ax = _perms.accessibility_trusted()
-    check("Accessibility permission granted", ax)
+    # CGEventTap creation succeeds iff the process has effective event-
+    # tap rights — Apple gates this on either Accessibility or Input
+    # Monitoring (both work). This probe creates a temporary listen-only
+    # tap and releases it.
+    ax = _perms.accessibility_effective()
+    check("CGEventTap allowed (Accessibility or Input Monitoring)", ax)
 
     # Caps Lock → F19 hidutil remap currently active?
     remap_active, remap_detail = _hidutil_caps_to_f19_active()

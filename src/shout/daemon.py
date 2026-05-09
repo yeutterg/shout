@@ -99,16 +99,13 @@ class Daemon:
         self._setup_logging()
         log.info("daemon starting; model=%s", self._model_id)
 
-        # Surface permission state at startup so the user does not waste
-        # time wondering why every transcript comes back empty (silent-
-        # zeros from a denied Microphone) or why F19 has no effect (no
-        # Accessibility for the event tap). Both checks are read-only.
+        # Surface microphone state at startup. The single most common
+        # reason transcripts come back empty is silent-zeros from a
+        # denied Microphone (sounddevice opens InputStream successfully
+        # but every sample is 0; see python-sounddevice#196). Mic check
+        # is read-only via AVCaptureDevice.
         mic_status = permissions.microphone_status()
-        ax_status = permissions.accessibility_trusted()
-        log.info(
-            "permissions: microphone=%s accessibility=%s",
-            mic_status, "yes" if ax_status else "no",
-        )
+        log.info("permissions: microphone=%s", mic_status)
         if mic_status not in ("authorized", "unknown"):
             log.error(
                 "Microphone permission is %r. Audio capture will return "
@@ -117,14 +114,12 @@ class Daemon:
                 "%s, then `brew services restart shout`.",
                 mic_status, sys.executable,
             )
-        if not ax_status:
-            log.error(
-                "Accessibility permission is missing. The F19 event tap "
-                "will not arm and CGEvent text injection will silently "
-                "fail. Add the daemon binary to System Settings → Privacy "
-                "& Security → Accessibility:\n  %s",
-                sys.executable,
-            )
+        # CGEventTap rights (Accessibility OR Input Monitoring) are
+        # checked when HotkeyListener.start() actually creates the tap;
+        # the listener itself logs a clear error if creation fails. We
+        # do not pre-probe here because Apple's
+        # AXIsProcessTrustedWithOptions disagrees with the actual
+        # CGEventTap behavior for ad-hoc-signed Pythons.
 
         # NSApplication has to be initialised on the main thread before
         # any AppKit object exists. Setting policy to Accessory keeps us
