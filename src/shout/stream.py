@@ -53,9 +53,19 @@ class Frame:
 
 
 class Streamer:
-    def __init__(self, model, context_size: tuple[int, int] = DEFAULT_CONTEXT_SIZE):
+    def __init__(
+        self,
+        model,
+        context_size: tuple[int, int] = DEFAULT_CONTEXT_SIZE,
+        input_device: str | None = None,
+    ):
         self._model = model
         self._context_size = context_size
+        # sounddevice accepts a device name or None for the system default.
+        # If the user picks a name and later unplugs that device,
+        # InputStream.start() raises and the session fails-soft (the
+        # daemon logs and returns to idle).
+        self._input_device = input_device
         self._stream_ctx = None  # the StreamingParakeet context manager
         self._streamer = None
         self._audio_q: queue.Queue[np.ndarray] = queue.Queue()
@@ -87,6 +97,7 @@ class Streamer:
             dtype="float32",
             blocksize=_BLOCKSIZE,
             callback=_audio_callback,
+            device=self._input_device,
         )
         self._sd_stream.start()
 

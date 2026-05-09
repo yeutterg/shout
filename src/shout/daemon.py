@@ -43,8 +43,9 @@ from typing import Optional
 from AppKit import NSApp, NSApplication, NSApplicationActivationPolicyAccessory
 from Foundation import NSOperationQueue
 
-from . import inject, paths, protocol
+from . import config, inject, paths, protocol
 from .hotkey import HotkeyListener
+from .menubar import MenuBar
 from .overlay import Overlay
 from .stream import DEFAULT_CONTEXT_SIZE, Streamer
 
@@ -75,6 +76,7 @@ class Daemon:
         self._exit_code = 0
 
         self._overlay: Optional[Overlay] = None
+        self._menubar: Optional[MenuBar] = None
         self._hotkey: Optional[HotkeyListener] = None
 
     # ----------------- public entry point -----------------
@@ -91,6 +93,9 @@ class Daemon:
         NSApp.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
 
         self._overlay = Overlay()
+        # Menu bar lives in the same NSApplication run loop as the
+        # overlay; constructed on main thread.
+        self._menubar = MenuBar()
 
         threading.Thread(
             target=self._socket_loop, name="shout-socket", daemon=True
@@ -161,7 +166,7 @@ class Daemon:
         log.info("session: start")
         self._overlay.show()
 
-        streamer = Streamer(model)
+        streamer = Streamer(model, input_device=config.get_input_device())
         try:
             streamer.start()
         except Exception:
