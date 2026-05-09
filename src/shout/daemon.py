@@ -87,6 +87,9 @@ class Daemon:
         self._overlay: Optional[Overlay] = None
         self._menubar: Optional[MenuBar] = None
         self._hotkey: Optional[HotkeyListener] = None
+        # Pending hide of the overlay 2 s after a session ends. Stored
+        # so the next session can cancel it before the timer fires.
+        self._auto_hide_timer: Optional[threading.Timer] = None
 
     # ----------------- public entry point -----------------
 
@@ -216,6 +219,13 @@ class Daemon:
             return
         self._session_running.set()
         log.info("session: start")
+
+        # Cancel any pending auto-hide from the previous session so it
+        # does not fire mid-way through this one.
+        if self._auto_hide_timer is not None:
+            self._auto_hide_timer.cancel()
+            self._auto_hide_timer = None
+
         self._overlay.show()
 
         streamer = Streamer(model, input_device=config.get_input_device())
@@ -227,6 +237,11 @@ class Daemon:
             self._session_running.clear()
             return
 
+        # Streaming phase: live preview only — text is NOT typed at the
+        # cursor during the hold. We type once at end-of-session from
+        # the batch result (see below), which is materially more
+        # accurate because it sees the full audio in both directions
+        # rather than the streaming model's ~1.3 s right-context window.
         try:
             while True:
                 try:
@@ -240,7 +255,6 @@ class Daemon:
                 frame = streamer.tick()
                 if frame is not None:
                     if frame.finalized_delta:
-                        inject.type_text(frame.finalized_delta)
                         self._overlay.append_finalized(frame.finalized_delta)
                     self._overlay.set_draft(frame.draft)
 
@@ -248,17 +262,32 @@ class Daemon:
         except Exception:
             log.exception("session: error mid-stream")
 
+        # Batch phase: close audio capture, run a full-context batch
+        # transcribe, type the result at the cursor.
         try:
-            final = streamer.stop()
-            if final.finalized_delta:
-                inject.type_text(final.finalized_delta)
-                self._overlay.append_finalized(final.finalized_delta)
+            streamer.stop()
         except Exception:
-            log.exception("session: error during stop")
+            log.exception("session: error closing streamer")
 
-        self._overlay.hide()
+        try:
+            batch_text = streamer.batch_transcribe()
+        except Exception:
+            log.exception("batch transcribe failed")
+            batch_text = ""
+
+        if batch_text:
+            self._overlay.set_batch_result(batch_text)
+            inject.type_text(batch_text)
+        log.info("session: stop (batch=%r)", batch_text)
+
+        # Auto-hide the overlay 2 s later. The user has the typed text
+        # in their app at this point; the overlay just shows them what
+        # actually got typed.
+        self._auto_hide_timer = threading.Timer(2.0, self._overlay.hide)
+        self._auto_hide_timer.daemon = True
+        self._auto_hide_timer.start()
+
         self._session_running.clear()
-        log.info("session: stop")
 
     # ----------------- socket thread -----------------
 

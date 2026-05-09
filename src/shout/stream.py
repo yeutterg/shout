@@ -17,13 +17,19 @@ The driver (daemon) is responsible for:
 
 from __future__ import annotations
 
+import logging
+import os
 import queue
+import tempfile
 from dataclasses import dataclass
 from typing import Optional
 
 import mlx.core as mx
 import numpy as np
 import sounddevice as sd
+import soundfile as sf
+
+log = logging.getLogger("shout.stream")
 
 # Parakeet TDT 0.6B v3 expects 16 kHz mono float32. Reading these from
 # the model at session start would be cleaner but adds an indirection
@@ -42,11 +48,6 @@ _BLOCKSIZE = 1_600  # 100 ms at 16 kHz
 # 1.5 s acceptance budget while giving the model meaningfully more
 # future context.
 DEFAULT_CONTEXT_SIZE = (256, 16)
-
-# Silence-pad duration on stop(). Must exceed
-# context_size[1] * frame_seconds to drive the right-context window
-# past everything spoken so all tokens finalize.
-_SILENCE_PAD_SECONDS = 1.5
 
 
 @dataclass
@@ -81,6 +82,10 @@ class Streamer:
         self._sd_stream: Optional[sd.InputStream] = None
         self._finalized_emitted_count = 0
         self._started = False
+        # Full audio buffer captured during this session, retained for
+        # batch_transcribe() after stop(). list-of-arrays so we avoid
+        # repeated reallocation during long sessions.
+        self._audio_log: list[np.ndarray] = []
 
     def start(self) -> None:
         """Open audio device and start the streaming context.
@@ -126,58 +131,73 @@ class Streamer:
             return None
 
         audio = np.concatenate(chunks).astype(np.float32)
+        # Retain a copy for the post-release batch transcribe.
+        self._audio_log.append(audio)
         self._streamer.add_audio(mx.array(audio))
 
         return self._build_frame()
 
     def stop(self) -> Frame:
-        """Close audio, drain any last chunks, force final finalization,
-        return the resulting frame.
+        """Close audio capture and the streaming context. Returns the
+        last streaming frame (for the live overlay); the canonical
+        transcription comes from a separate batch_transcribe() call.
 
-        After stop() the Streamer cannot be reused — make a new one
-        for the next session.
-
-        We pad the audio buffer with silence before reading the final
-        result. The streaming model holds back ~context_size[1] frames
-        of right-context before committing tokens; when the user
-        releases Caps Lock, the last ~1.3s of speech is still in
-        `draft` and would be wrong if we just typed it. Pushing 1.5s
-        of silence into add_audio() slides the right-context window
-        past the actual speech, so the model finalizes those tokens
-        properly. We then take the new finalized delta and discard
-        any draft (which would only contain silence-driven artifacts).
-        Empirically this turns "I want to write us" (mistranscription
-        because the trailing tokens never had full right-context) into
-        "I want to write a sentence" or whatever the user actually said.
+        The audio log is retained so batch_transcribe() can run
+        full-context inference over the entire session afterwards.
         """
         if self._sd_stream is not None:
             self._sd_stream.stop()
             self._sd_stream.close()
             self._sd_stream = None
 
-        # Drain whatever audio arrived between the last tick() and now.
-        leftover_frame = self.tick() or Frame(finalized_delta="", draft="")
+        # Drain any final chunks (also updates the live overlay one
+        # last time before we tear down).
+        leftover = self.tick() or Frame(finalized_delta="", draft="")
 
-        # Silence-pad to force finalization of in-flight tokens.
-        # 1.5s comfortably exceeds our right-context (16 frames * 80ms = 1.28s).
-        if self._streamer is not None:
-            pad_samples = int(_SILENCE_PAD_SECONDS * _SAMPLE_RATE)
-            self._streamer.add_audio(mx.zeros(pad_samples, dtype=mx.float32))
-            silence_frame = self._build_frame()
-        else:
-            silence_frame = Frame(finalized_delta="", draft="")
-
-        # Close the streaming context (frees MLX caches).
         if self._stream_ctx is not None:
             self._stream_ctx.__exit__(None, None, None)
             self._stream_ctx = None
             self._streamer = None
 
-        return Frame(
-            finalized_delta=leftover_frame.finalized_delta
-            + silence_frame.finalized_delta,
-            draft="",
-        )
+        return leftover
+
+    def batch_transcribe(self) -> str:
+        """Run a full-context (non-streaming) batch transcribe over the
+        audio captured during this session.
+
+        Streaming gives live feedback but compromises on accuracy
+        because each token only sees ~1.3 s of right-context. Batch
+        sees the entire utterance in both directions, which is the
+        same model in a more accurate configuration. We only run this
+        once per session, after the user releases Caps Lock.
+
+        parakeet-mlx's `transcribe()` takes a file path (it uses ffmpeg
+        internally to load+resample), so we write the captured audio
+        to a temp WAV at the model's native rate and hand off the path.
+        """
+        if not self._audio_log:
+            return ""
+        full = np.concatenate(self._audio_log).astype(np.float32)
+
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            tmp_path = f.name
+        try:
+            sf.write(tmp_path, full, samplerate=_SAMPLE_RATE)
+            result = self._model.transcribe(tmp_path)
+            text = getattr(result, "text", "") or ""
+            log.info(
+                "batch transcribed %.2f s of audio → %d chars",
+                len(full) / _SAMPLE_RATE, len(text),
+            )
+            return text
+        except Exception:
+            log.exception("batch transcribe failed")
+            return ""
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except FileNotFoundError:
+                pass
 
     def _build_frame(self) -> Frame:
         # Single-threaded: tick() (and therefore _build_frame) is only
