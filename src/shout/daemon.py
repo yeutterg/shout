@@ -1,12 +1,16 @@
 """Long-running Shout daemon.
 
-Lifecycle (single process, three threads):
+Lifecycle (single process, four threads):
 
-  Main thread       Tk mainloop. Owns the overlay window. Polls a queue
-                    every ~33 ms for UI updates posted by the worker.
+  Main thread       AppKit run loop. Owns the NSPanel overlay. Workers
+                    post UI updates as blocks on the main NSOperationQueue.
 
   Socket thread     Accepts Unix-socket connections, parses commands,
                     posts session-state messages onto cmd_q.
+
+  Hotkey thread     Quartz CGEventTap for F19 (down/up + auto-repeat
+                    filter + triple-tap → real-Caps-Lock fallback).
+                    Posts "start" / "stop" onto cmd_q.
 
   Worker thread     Owns the MLX model and the active Streamer. Loads
                     weights once at startup, pre-warms the encoder
@@ -14,8 +18,8 @@ Lifecycle (single process, three threads):
                     first real session would pay a ~2.5 s shader-compile
                     cost — see scripts/bench-cold-start.py), then runs
                     a session loop: awaits start, ticks at ~30 Hz,
-                    types newly-finalized text via Quartz, posts overlay
-                    updates onto ui_q.
+                    types newly-finalized text via Quartz, calls
+                    overlay.append_finalized / set_draft.
 
 MLX has per-thread stream state — the model and all add_audio calls
 must happen on the same thread that loaded the model. That is why the
@@ -33,10 +37,11 @@ import os
 import socket
 import threading
 import time
-import tkinter as tk
-from dataclasses import dataclass
 from queue import Empty, Queue
 from typing import Optional
+
+from AppKit import NSApp, NSApplication, NSApplicationActivationPolicyAccessory
+from Foundation import NSOperationQueue
 
 from . import inject, paths, protocol
 from .hotkey import HotkeyListener
@@ -50,9 +55,6 @@ DEFAULT_MODEL = "mlx-community/parakeet-tdt-0.6b-v3"
 _TICK_HZ = 30
 _TICK_INTERVAL_S = 1.0 / _TICK_HZ
 
-# How often the main thread drains the UI queue.
-_UI_POLL_MS = 33
-
 # Shader pre-warm: feed N seconds of silence through transcribe_stream
 # before the first real session, so the Metal kernels are JIT-compiled
 # and cached. ~1 s is plenty for the encoder pass to fire at least once.
@@ -62,26 +64,16 @@ _WARMUP_SAMPLE_RATE = 16_000
 log = logging.getLogger("shout.daemon")
 
 
-@dataclass
-class _UIMsg:
-    """Cross-thread message from worker → main(tk) thread."""
-
-    kind: str  # "show" | "hide" | "finalized" | "draft"
-    text: str = ""
-
-
 class Daemon:
     def __init__(self, model_id: str = DEFAULT_MODEL) -> None:
         self._model_id = model_id
 
-        self._ui_q: Queue[_UIMsg] = Queue()
         self._cmd_q: Queue[str] = Queue()
         self._model_ready = threading.Event()
         self._session_running = threading.Event()
         self._shutdown = threading.Event()
-        self._fatal = False  # set on irrecoverable failure (model load)
+        self._exit_code = 0
 
-        self._root: Optional[tk.Tk] = None
         self._overlay: Optional[Overlay] = None
         self._hotkey: Optional[HotkeyListener] = None
 
@@ -92,9 +84,13 @@ class Daemon:
         self._setup_logging()
         log.info("daemon starting; model=%s", self._model_id)
 
-        self._root = tk.Tk()
-        self._root.withdraw()
-        self._overlay = Overlay(self._root)
+        # NSApplication has to be initialised on the main thread before
+        # any AppKit object exists. Setting policy to Accessory keeps us
+        # out of the dock and app-switcher.
+        NSApplication.sharedApplication()
+        NSApp.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
+
+        self._overlay = Overlay()
 
         threading.Thread(
             target=self._socket_loop, name="shout-socket", daemon=True
@@ -103,48 +99,16 @@ class Daemon:
             target=self._worker_loop, name="shout-worker", daemon=True
         ).start()
 
-        # F19 listener replaces what Hammerspoon used to do. It posts
-        # raw start/stop strings onto the same cmd_q the socket thread
-        # uses, so the worker treats keyboard-driven and IPC-driven
-        # sessions identically.
+        # F19 listener replaces what Hammerspoon used to do. Same cmd_q
+        # the socket thread uses.
         self._hotkey = HotkeyListener(self._cmd_q)
         self._hotkey.start()
 
-        self._root.after(_UI_POLL_MS, self._drain_ui_queue)
         try:
-            self._root.mainloop()
+            NSApp.run()  # blocks until os._exit (see _shutdown_now).
         except KeyboardInterrupt:
-            pass
-        finally:
-            self._shutdown.set()
-            if self._hotkey is not None:
-                self._hotkey.stop()
-            try:
-                os.unlink(paths.SOCKET_PATH)
-            except FileNotFoundError:
-                pass
-        return 1 if self._fatal else 0
-
-    # ----------------- main thread (tk) -----------------
-
-    def _drain_ui_queue(self) -> None:
-        try:
-            while True:
-                msg = self._ui_q.get_nowait()
-                if msg.kind == "show":
-                    self._overlay.show()
-                elif msg.kind == "hide":
-                    self._overlay.hide()
-                elif msg.kind == "finalized":
-                    self._overlay.append_finalized(msg.text)
-                elif msg.kind == "draft":
-                    self._overlay.set_draft(msg.text)
-        except Empty:
-            pass
-        if not self._shutdown.is_set():
-            self._root.after(_UI_POLL_MS, self._drain_ui_queue)
-        else:
-            self._root.quit()
+            self._shutdown_now(0)
+        return self._exit_code
 
     # ----------------- worker thread -----------------
 
@@ -159,8 +123,7 @@ class Daemon:
             model = parakeet_mlx.from_pretrained(self._model_id)
         except Exception:
             log.exception("model load failed")
-            self._fatal = True
-            self._shutdown.set()
+            self._shutdown_now(1)
             return
         log.info("model loaded in %.2f s", time.perf_counter() - t0)
 
@@ -177,8 +140,6 @@ class Daemon:
                 s.add_audio(silence)
             log.info("shaders warm in %.2f s", time.perf_counter() - t0)
         except Exception:
-            # Pre-warm is best-effort — if it fails, real sessions still
-            # work, they just pay the cold-shader cost on first audio.
             log.warning("shader warm-up failed", exc_info=True)
 
         self._model_ready.set()
@@ -198,14 +159,14 @@ class Daemon:
             return
         self._session_running.set()
         log.info("session: start")
-        self._ui_q.put(_UIMsg(kind="show"))
+        self._overlay.show()
 
         streamer = Streamer(model)
         try:
             streamer.start()
         except Exception:
             log.exception("session: failed to start streamer")
-            self._ui_q.put(_UIMsg(kind="hide"))
+            self._overlay.hide()
             self._session_running.clear()
             return
 
@@ -223,10 +184,8 @@ class Daemon:
                 if frame is not None:
                     if frame.finalized_delta:
                         inject.type_text(frame.finalized_delta)
-                        self._ui_q.put(
-                            _UIMsg(kind="finalized", text=frame.finalized_delta)
-                        )
-                    self._ui_q.put(_UIMsg(kind="draft", text=frame.draft))
+                        self._overlay.append_finalized(frame.finalized_delta)
+                    self._overlay.set_draft(frame.draft)
 
                 time.sleep(_TICK_INTERVAL_S)
         except Exception:
@@ -236,13 +195,11 @@ class Daemon:
             final = streamer.stop()
             if final.finalized_delta:
                 inject.type_text(final.finalized_delta)
-                self._ui_q.put(
-                    _UIMsg(kind="finalized", text=final.finalized_delta)
-                )
+                self._overlay.append_finalized(final.finalized_delta)
         except Exception:
             log.exception("session: error during stop")
 
-        self._ui_q.put(_UIMsg(kind="hide"))
+        self._overlay.hide()
         self._session_running.clear()
         log.info("session: stop")
 
@@ -310,11 +267,39 @@ class Daemon:
             )
         elif cmd == protocol.CMD_QUIT:
             conn.sendall(protocol.encode({"ok": True}))
-            self._shutdown.set()
+            self._shutdown_now(0)
         else:
             conn.sendall(
                 protocol.encode({"ok": False, "error": f"unknown cmd: {cmd}"})
             )
+
+    # ----------------- shutdown -----------------
+
+    def _shutdown_now(self, code: int) -> None:
+        """Tear down everything and exit the process with `code`.
+
+        Called from any thread. We use os._exit (rather than asking
+        NSApp.run() to return) because breaking out of the AppKit
+        run loop from a background thread is finicky: NSApp.stop_()
+        only takes effect after the next event, so we'd need to post
+        a fake event from the main queue. Doing the cleanup here on
+        the calling thread and then os._exit is simpler and works
+        the same in launchd's eyes."""
+        if self._shutdown.is_set():
+            return
+        self._shutdown.set()
+        self._exit_code = code
+        try:
+            if self._hotkey is not None:
+                self._hotkey.stop()
+        except Exception:
+            pass
+        try:
+            os.unlink(paths.SOCKET_PATH)
+        except FileNotFoundError:
+            pass
+        log.info("daemon exiting with code %d", code)
+        os._exit(code)
 
     # ----------------- helpers -----------------
 

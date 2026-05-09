@@ -163,17 +163,17 @@ def _doctor() -> int:
         mark = "✓" if ok else "✗"
         rows.append((mark, label, detail))
 
-    # tkinter is bundled with stock Python builds but Homebrew's
-    # python@3.12 ships without it (python-tk@3.12 is a separate formula).
+    # AppKit (via pyobjc) drives the floating overlay. If this fails,
+    # the daemon will crash at startup with no visible recovery.
     try:
-        import tkinter  # noqa: F401
+        import AppKit  # noqa: F401
 
-        tk_ok = True
-        tk_detail = ""
+        ui_ok = True
+        ui_detail = ""
     except ImportError as e:
-        tk_ok = False
-        tk_detail = f"({e})"
-    check("tkinter importable", tk_ok, tk_detail)
+        ui_ok = False
+        ui_detail = f"({e})"
+    check("AppKit importable", ui_ok, ui_detail)
 
     # Caps Lock → F19 hidutil remap currently active?
     remap_active, remap_detail = _hidutil_caps_to_f19_active()

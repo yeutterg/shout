@@ -25,9 +25,6 @@ class Shout < Formula
   # MLX is Apple-Silicon only. Failing fast at install is friendlier than
   # a `Stream(gpu, 0)` runtime crash on Intel Macs.
   depends_on arch: :arm64
-  # Tkinter is a separate Homebrew formula for python@3.12; the daemon
-  # uses it for the floating overlay.
-  depends_on "python-tk@3.12"
   depends_on "python@3.12"
 
   def install
@@ -43,7 +40,8 @@ class Shout < Formula
            "parakeet-mlx>=0.3",
            "sounddevice>=0.5",
            "numpy>=2.0",
-           "pyobjc-framework-Quartz>=10.3"
+           "pyobjc-framework-Quartz>=10.3",
+           "pyobjc-framework-Cocoa>=10.3"
 
     # Install Shout itself last so its console_scripts entrypoint
     # ('shout = shout.cli:main') is registered against this venv.

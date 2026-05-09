@@ -1,154 +1,197 @@
-"""Floating tentative-token overlay (tkinter-based).
+"""Floating tentative-token overlay.
 
-Borderless, always-on-top, semi-transparent strip pinned to bottom-center.
-v0 polish target: legible and unobtrusive. Swift NSPanel is a v1 swap.
+Uses an AppKit `NSPanel` (via pyobjc) configured as a non-activating,
+borderless, always-on-top floating panel — the same class Spotlight,
+Alfred, and Wispr Flow use. Critically, this class of NSWindow never
+becomes the *key* window when shown, so the user's previously-focused
+text field stays focused and CGEvent text injection lands there.
 
-The strip shows a rolling window of the most-recent finalized text plus
-the current (still-being-revised) draft. Showing only the draft is
-information-poor — the draft is just whatever falls inside the right-
-context window of parakeet-mlx, typically 1-3 words. With finalized
-history added, the user sees a sentence-or-so of context, which makes
-edits and intent visible without scrolling the cursor.
+We tried Tk's `::tk::unsupported::MacWindowStyle` to get the same
+behavior on a Toplevel, but on macOS 12+ Tk's borderless windows still
+take focus on `deiconify()`. NSPanel is the documented, stable path.
 
-Critical macOS detail: Tk Toplevels become the *key* window when shown
-(especially after `lift()`), which steals keyboard focus from whatever
-app the user was typing into. CGEvent text injection then lands in the
-overlay (a tk.Label, which silently drops keystrokes) instead of the
-target app. We fix this by switching the window to the macOS native
-"floating, non-activating" style — a class of NSPanel that floats
-above other windows without ever becoming key.
+The strip shows a rolling window of the most-recent finalized text
+plus the current draft, in two colors.
 
-Threading rule: all tkinter calls must come from the thread that owns
-the Tk root (the daemon's main thread). Workers schedule updates via
-the daemon's UI queue, drained by `Daemon._drain_ui_queue`.
+Threading: every public method is safe to call from any thread. State
+mutations and AppKit calls dispatch to the main thread via
+`NSOperationQueue.mainQueue()`.
 """
 
 from __future__ import annotations
 
 import logging
-import tkinter as tk
+
+import objc
+from AppKit import (
+    NSApp,
+    NSApplication,
+    NSApplicationActivationPolicyAccessory,
+    NSBackingStoreBuffered,
+    NSColor,
+    NSFont,
+    NSPanel,
+    NSScreen,
+    NSScreenSaverWindowLevel,
+    NSTextField,
+    NSWindowCollectionBehaviorCanJoinAllSpaces,
+    NSWindowStyleMaskBorderless,
+    NSWindowStyleMaskNonactivatingPanel,
+)
+from Foundation import NSMakeRect, NSOperationQueue
 
 
-_BG = "#1a1a1a"
-_FG_FINAL = "#dddddd"
-_FG_DRAFT = "#9aa0a8"
-# Half the prior font size so we can fit ~2x the words.
-_FONT = ("Helvetica Neue", 14)
-# Roughly 2x the prior min-height. Actual size tracks text via geometry.
-_MIN_HEIGHT = 112
-_BOTTOM_MARGIN = 80
-# Fixed overlay width, so growing text wraps within it instead of
-# stretching the strip across the screen.
-_WIDTH = 760
-# Roll the displayed history up to this many characters. With the
-# smaller font and wider strip, ~240 chars renders comfortably across
-# 2-3 wrapped lines.
+_BG_R, _BG_G, _BG_B, _BG_A = 0.10, 0.10, 0.10, 0.92
+_FG_HISTORY = (0.87, 0.87, 0.87, 1.00)
+_FG_DRAFT = (0.62, 0.65, 0.69, 1.00)
+_FONT_SIZE = 14.0
+_HEIGHT = 112.0
+_WIDTH = 760.0
+_BOTTOM_MARGIN = 80.0
+_PADDING = 18.0
 _HISTORY_CHARS = 240
 
 log = logging.getLogger("shout.overlay")
 
 
+def _on_main(fn):
+    """Schedule fn() on the main thread; safe from any thread."""
+    NSOperationQueue.mainQueue().addOperationWithBlock_(fn)
+
+
 class Overlay:
-    """Wraps a Toplevel that shows a rolling transcript window."""
+    """Non-activating floating NSPanel showing recent transcript text."""
 
-    def __init__(self, root: tk.Tk) -> None:
-        self._root = root
-        self._win = tk.Toplevel(root)
-        self._win.withdraw()
-        self._win.overrideredirect(True)
-        # Set the macOS NSPanel-style class to "floating" with the
-        # `nonActivatingPanel` attribute. This is the same trick
-        # Wispr Flow / Spotlight / Alfred use: the window floats above
-        # other apps without ever stealing focus, so CGEvent text
-        # injection continues to land in whatever app was previously
-        # focused.
-        try:
-            self._win.tk.call(
-                "::tk::unsupported::MacWindowStyle",
-                "style",
-                self._win._w,
-                "floating",
-                "nonActivating",
-            )
-        except tk.TclError:
-            log.warning(
-                "could not set MacWindowStyle (non-macOS or older Tk?); "
-                "overlay may steal keyboard focus"
-            )
-        self._win.attributes("-topmost", True)
-        self._win.attributes("-alpha", 0.92)
-        self._win.configure(bg=_BG)
+    def __init__(self) -> None:
+        # NSApplication must be initialised before we create any panel.
+        # Daemon.run() does this once at startup; we re-do it here as a
+        # no-op safeguard.
+        NSApplication.sharedApplication()
+        NSApp.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
 
-        # Two adjacent labels: brighter for finalized history, dimmer
-        # for the draft tail. wraplength forces text to wrap at the
-        # overlay width rather than letting the strip grow horizontally.
-        self._frame = tk.Frame(self._win, bg=_BG)
-        self._frame.pack(padx=18, pady=12, fill=tk.BOTH, expand=True)
-        wrap = _WIDTH - 36  # account for padx
-        self._final_label = tk.Label(
-            self._frame,
-            text="",
-            fg=_FG_FINAL,
-            bg=_BG,
-            font=_FONT,
-            wraplength=wrap,
-            justify=tk.LEFT,
-            anchor="w",
+        screen = NSScreen.mainScreen().frame()
+        x = (screen.size.width - _WIDTH) / 2.0
+        y = _BOTTOM_MARGIN
+        frame = NSMakeRect(x, y, _WIDTH, _HEIGHT)
+
+        style_mask = (
+            NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel
         )
-        self._final_label.pack(side=tk.LEFT, anchor="nw")
-        self._draft_label = tk.Label(
-            self._frame,
-            text="",
-            fg=_FG_DRAFT,
-            bg=_BG,
-            font=_FONT,
-            wraplength=wrap,
-            justify=tk.LEFT,
-            anchor="w",
+        panel = NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
+            frame, style_mask, NSBackingStoreBuffered, False
         )
-        self._draft_label.pack(side=tk.LEFT, anchor="nw")
+        panel.setOpaque_(False)
+        panel.setHasShadow_(False)
+        panel.setBackgroundColor_(
+            NSColor.colorWithRed_green_blue_alpha_(_BG_R, _BG_G, _BG_B, _BG_A)
+        )
+        panel.setLevel_(NSScreenSaverWindowLevel)
+        panel.setFloatingPanel_(True)
+        panel.setHidesOnDeactivate_(False)
+        panel.setBecomesKeyOnlyIfNeeded_(True)
+        panel.setCollectionBehavior_(
+            NSWindowCollectionBehaviorCanJoinAllSpaces
+        )
 
+        # Two stacked text fields: brighter "history", dimmer "draft".
+        # We keep them as siblings inside the content view, both with
+        # frame-based layout (auto-resizing turned off so explicit
+        # frame updates take effect on every render).
+        content = panel.contentView()
+        inner_w = _WIDTH - 2.0 * _PADDING
+        inner_h = _HEIGHT - 2.0 * _PADDING
+
+        history_field = _make_label(
+            NSMakeRect(_PADDING, _PADDING, inner_w, inner_h),
+            _FG_HISTORY,
+        )
+        content.addSubview_(history_field)
+
+        draft_field = _make_label(
+            NSMakeRect(_PADDING, _PADDING, inner_w, inner_h),
+            _FG_DRAFT,
+        )
+        content.addSubview_(draft_field)
+
+        self._panel = panel
+        self._history_field = history_field
+        self._draft_field = draft_field
         self._history = ""
         self._draft = ""
 
-    # ---- public API ----
+    # ---- public API (safe from any thread) ----
 
     def show(self) -> None:
-        self._reposition()
-        self._win.deiconify()
-        # NB: no lift() — that promotes the window to key/active and
-        # would defeat the nonActivating panel style on macOS.
+        # orderFrontRegardless does NOT make the panel key, because
+        # the NSWindowStyleMaskNonactivatingPanel mask short-circuits
+        # the activation. The user's app stays focused.
+        _on_main(lambda: self._panel.orderFrontRegardless())
 
     def hide(self) -> None:
-        self._win.withdraw()
-        self._history = ""
-        self._draft = ""
-        self._final_label.configure(text="")
-        self._draft_label.configure(text="")
+        def go():
+            self._panel.orderOut_(None)
+            self._history = ""
+            self._draft = ""
+            self._history_field.setStringValue_("")
+            self._draft_field.setStringValue_("")
+        _on_main(go)
 
     def append_finalized(self, text: str) -> None:
-        self._history = (self._history + text)[-_HISTORY_CHARS:]
-        self._render()
+        def go():
+            self._history = (self._history + text)[-_HISTORY_CHARS:]
+            self._render_locked()
+        _on_main(go)
 
     def set_draft(self, draft: str) -> None:
-        self._draft = draft
-        self._render()
+        def go():
+            self._draft = draft
+            self._render_locked()
+        _on_main(go)
 
-    # ---- internals ----
+    # ---- main-thread internals ----
 
-    def _render(self) -> None:
+    def _render_locked(self) -> None:
         history = self._history.lstrip() if self._history else ""
         draft = self._draft if history else self._draft.lstrip()
-        self._final_label.configure(text=history)
-        self._draft_label.configure(text=draft)
-        self._reposition()
 
-    def _reposition(self) -> None:
-        self._win.update_idletasks()
-        screen_w = self._root.winfo_screenwidth()
-        screen_h = self._root.winfo_screenheight()
-        win_w = _WIDTH
-        win_h = max(self._win.winfo_reqheight(), _MIN_HEIGHT)
-        x = (screen_w - win_w) // 2
-        y = screen_h - win_h - _BOTTOM_MARGIN
-        self._win.geometry(f"{win_w}x{win_h}+{x}+{y}")
+        # Render history left-aligned, then position the draft field
+        # immediately after. Manual layout because NSStackView would be
+        # overkill for two labels.
+        self._history_field.setStringValue_(history)
+        self._history_field.sizeToFit()
+        history_size = self._history_field.frame().size
+
+        self._draft_field.setStringValue_(draft)
+        self._draft_field.sizeToFit()
+        draft_size = self._draft_field.frame().size
+
+        # Keep both fields inside the panel; if combined width exceeds
+        # the inner content width, draft wraps to the next visual line
+        # automatically (sizeToFit respects NSTextField wrapping).
+        history_origin_y = (_HEIGHT - history_size.height) / 2.0
+        draft_origin_y = (_HEIGHT - draft_size.height) / 2.0
+        self._history_field.setFrameOrigin_(
+            (_PADDING, history_origin_y)
+        )
+        self._draft_field.setFrameOrigin_(
+            (_PADDING + history_size.width, draft_origin_y)
+        )
+
+
+def _make_label(frame, fg) -> NSTextField:
+    """A non-editable, transparent-background NSTextField."""
+    f = NSTextField.alloc().initWithFrame_(frame)
+    f.setEditable_(False)
+    f.setSelectable_(False)
+    f.setBezeled_(False)
+    f.setBordered_(False)
+    f.setDrawsBackground_(False)
+    f.setFont_(NSFont.systemFontOfSize_(_FONT_SIZE))
+    f.setTextColor_(
+        NSColor.colorWithRed_green_blue_alpha_(*fg)
+    )
+    f.cell().setUsesSingleLineMode_(False)
+    f.cell().setWraps_(True)
+    f.cell().setLineBreakMode_(0)  # NSLineBreakByWordWrapping
+    f.setStringValue_("")
+    return f

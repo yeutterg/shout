@@ -1056,6 +1056,7 @@ source = { editable = "." }
 dependencies = [
     { name = "numpy" },
     { name = "parakeet-mlx" },
+    { name = "pyobjc-framework-cocoa" },
     { name = "pyobjc-framework-quartz" },
     { name = "sounddevice" },
 ]
@@ -1070,6 +1071,7 @@ dev = [
 requires-dist = [
     { name = "numpy", specifier = ">=2.0" },
     { name = "parakeet-mlx", specifier = ">=0.3" },
+    { name = "pyobjc-framework-cocoa", specifier = ">=10.3" },
     { name = "pyobjc-framework-quartz", specifier = ">=10.3" },
     { name = "sounddevice", specifier = ">=0.5" },
 ]
