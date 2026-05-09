@@ -80,6 +80,7 @@ class Daemon:
         self._cmd_q: Queue[str] = Queue()
         self._model_ready = threading.Event()
         self._session_running = threading.Event()
+        self._reload_requested = threading.Event()
         self._shutdown = threading.Event()
         self._exit_code = 0
 
@@ -102,13 +103,15 @@ class Daemon:
 
         self._overlay = Overlay()
         # Menu bar lives in the same NSApplication run loop as the
-        # overlay; constructed on main thread. Quit (clean exit 0) and
-        # Restart (exit 1, which brew services interprets as a crash
-        # and relaunches automatically) are both wired through
-        # _shutdown_now.
+        # overlay; constructed on main thread.
+        # `on_restart` is in-process model reload (the worker drops the
+        # current model, loads the one config.get_model() now points at,
+        # warms shaders, resumes serving) — so the menu bar item never
+        # disappears. `on_quit` exits cleanly (code 0); brew services
+        # treats that as "stay down" and does not relaunch.
         self._menubar = MenuBar(
             on_quit=lambda: self._shutdown_now(0),
-            on_restart=lambda: self._shutdown_now(1),
+            on_restart=lambda: self._reload_requested.set(),
         )
 
         threading.Thread(
@@ -136,34 +139,69 @@ class Daemon:
         import mlx.core as mx
         import parakeet_mlx
 
-        log.info("loading model …")
-        t0 = time.perf_counter()
-        try:
-            model = parakeet_mlx.from_pretrained(self._model_id)
-        except Exception:
-            log.exception("model load failed")
+        def load(model_id: str):
+            log.info("loading model %s …", model_id)
+            t0 = time.perf_counter()
+            try:
+                m = parakeet_mlx.from_pretrained(model_id)
+            except Exception:
+                log.exception("model load failed: %s", model_id)
+                return None
+            log.info("model loaded in %.2f s", time.perf_counter() - t0)
+            return m
+
+        def warm(m) -> None:
+            # Pre-warm shader compilation. Without this, the first
+            # add_audio() of the first session pays ~2.5 s of Metal
+            # kernel JIT (see bench-cold-start.py phase `first_chunk_s`
+            # first run vs. warm runs).
+            try:
+                t0 = time.perf_counter()
+                silence = mx.zeros(
+                    int(_WARMUP_AUDIO_SECONDS * _WARMUP_SAMPLE_RATE)
+                )
+                with m.transcribe_stream(
+                    context_size=DEFAULT_CONTEXT_SIZE
+                ) as s:
+                    s.add_audio(silence)
+                log.info("shaders warm in %.2f s", time.perf_counter() - t0)
+            except Exception:
+                log.warning("shader warm-up failed", exc_info=True)
+
+        model = load(self._model_id)
+        if model is None:
             self._shutdown_now(1)
             return
-        log.info("model loaded in %.2f s", time.perf_counter() - t0)
-
-        # Pre-warm shader compilation. Without this, the very first
-        # add_audio() call of the first session takes ~2.5 s while Metal
-        # kernels are JIT-compiled (see bench-cold-start.py phase
-        # `first_chunk_s` first run vs. warm runs).
-        try:
-            t0 = time.perf_counter()
-            silence = mx.zeros(
-                int(_WARMUP_AUDIO_SECONDS * _WARMUP_SAMPLE_RATE)
-            )
-            with model.transcribe_stream(context_size=DEFAULT_CONTEXT_SIZE) as s:
-                s.add_audio(silence)
-            log.info("shaders warm in %.2f s", time.perf_counter() - t0)
-        except Exception:
-            log.warning("shader warm-up failed", exc_info=True)
-
+        warm(model)
         self._model_ready.set()
 
         while not self._shutdown.is_set():
+            # Service a model-reload request (from the menu bar's
+            # Model / Language selection) before pulling the next
+            # session command.
+            if self._reload_requested.is_set():
+                self._reload_requested.clear()
+                new_id = config.get_model() or DEFAULT_MODEL
+                if new_id != self._model_id:
+                    log.info("reload: %s → %s", self._model_id, new_id)
+                    self._model_ready.clear()
+                    new_model = load(new_id)
+                    if new_model is None:
+                        # Reload failed — keep the old model and
+                        # revert config so the menu bar reflects truth.
+                        log.error("reload failed; reverting config")
+                        config.set_model(
+                            None if self._model_id == DEFAULT_MODEL
+                            else self._model_id
+                        )
+                        self._model_ready.set()
+                    else:
+                        model = new_model
+                        self._model_id = new_id
+                        mx.clear_cache()
+                        warm(model)
+                        self._model_ready.set()
+
             try:
                 cmd = self._cmd_q.get(timeout=0.1)
             except Empty:
