@@ -132,8 +132,17 @@ class HotkeyListener:
         if keycode != _F19_KEYCODE:
             return event  # not ours, pass through
 
+        # While the user holds the key, macOS sends a stream of
+        # auto-repeat keyDown events (~30 Hz). We must ignore those:
+        # otherwise our tap-counter immediately hits 3 within 400 ms
+        # and fires the triple-tap → real-Caps-Lock path, which ends
+        # the PTT session prematurely and yanks the overlay away.
         if event_type == Quartz.kCGEventKeyDown:
-            self._on_press()
+            autorepeat = Quartz.CGEventGetIntegerValueField(
+                event, Quartz.kCGKeyboardEventAutorepeat
+            )
+            if not autorepeat:
+                self._on_press()
         elif event_type == Quartz.kCGEventKeyUp:
             self._on_release()
         # Suppress the F19 event itself so no other app sees it.
